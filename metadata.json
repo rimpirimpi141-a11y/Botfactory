@@ -1,0 +1,6 @@
+{
+  "name": "BOT FACTORY",
+  "description": "Build. Customize. Deploy. A multi-tenant Telegram bot creation platform powered by Cloudflare Workers, D1, KV, and Analytics Engine.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
