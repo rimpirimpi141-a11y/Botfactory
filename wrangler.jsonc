@@ -23,7 +23,7 @@
     {
       "binding": "DB",
       "database_name": "bot_factory_db",
-      "database_id": "REPLACE_WITH_YOUR_D1_DATABASE_ID",
+      ""database_id": "76e2574b-a08a-4dbc-9262-94e4848e7da4",
       "migrations_dir": "migrations"
     }
   ],
@@ -32,8 +32,9 @@
   // Run `npx wrangler kv namespace create BOT_FACTORY_KV` and paste your real id below.
   "kv_namespaces": [
     {
-      "binding": "KV",
-      "id": "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+      
+  "binding": "KV",
+  "id": "ad7a011ffadc40c4a5cf9514a9455401"
     }
   ],
 
