@@ -23,7 +23,7 @@
     {
       "binding": "DB",
       "database_name": "bot_factory_db",
-      ""database_id": "76e2574b-a08a-4dbc-9262-94e4848e7da4",
+      "database_id": "76e2574b-a08a-4dbc-9262-94e4848e7da4",
       "migrations_dir": "migrations"
     }
   ],
