@@ -493,3 +493,530 @@ test('Internal bot ID and webhook secret generators satisfy security entropy and
   const secret = generateWebhookSecret();
   assert.equal(secret.length, 64);
 });
+
+// ============================================================================
+// 8. MASTER BOT — MANUAL WEBHOOK REGISTRATION & VERIFICATION
+// ============================================================================
+test('Master Bot manual webhook registration sets exact URL, secret_token, allowed_updates, verifies via getWebhookInfo, and leaks zero secrets', async () => {
+  const workerUrl = 'https://botfactory.rimpirimpi141.workers.dev';
+  const env = buildTestEnv({ WORKER_PUBLIC_URL: workerUrl });
+  const { fetchImpl, calls } = createMockTelegramFetch();
+
+  // Before registration, status should report not_registered & ready configuration
+  const beforeRes = await routeRequest(
+    new Request(`${workerUrl}/api/master/webhook-status`, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${env.ADMIN_API_KEY}` },
+    }),
+    env,
+    {},
+    { fetchImpl }
+  );
+  assert.equal(beforeRes.status, 200);
+  const beforeBody = await beforeRes.json();
+  assert.equal(beforeBody.ok, true);
+  assert.equal(beforeBody.configuration.workerPublicUrl, workerUrl);
+  assert.equal(beforeBody.configuration.expectedWebhookUrl, `${workerUrl}/webhook/master`);
+  assert.equal(beforeBody.configuration.masterBotTokenConfigured, true);
+  assert.equal(beforeBody.configuration.masterWebhookSecretConfigured, true);
+  assert.equal(beforeBody.webhook.status, 'not_registered');
+
+  // Trigger manual Master Bot webhook registration
+  const regRes = await routeRequest(
+    new Request(`${workerUrl}/api/master/register-webhook`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${env.ADMIN_API_KEY}` },
+    }),
+    env,
+    {},
+    { fetchImpl }
+  );
+  assert.equal(regRes.status, 200);
+  const regText = await regRes.text();
+  const regBody = JSON.parse(regText);
+
+  assert.equal(regBody.ok, true);
+  assert.equal(regBody.verified, true);
+  assert.equal(regBody.status, 'verified');
+  assert.equal(regBody.verification.webhookUrl, `${workerUrl}/webhook/master`);
+  assert.ok(regBody.lastRegisteredAt);
+
+  // Verify exact Telegram setWebhook call parameters
+  const setCall = calls.find((c) => c.method === 'setWebhook');
+  assert.ok(setCall, 'Expected setWebhook to be called');
+  assert.equal(setCall.body.url, `${workerUrl}/webhook/master`);
+  assert.equal(setCall.body.secret_token, env.MASTER_WEBHOOK_SECRET);
+  assert.deepEqual(setCall.body.allowed_updates, ['message', 'callback_query']);
+
+  // Verify getWebhookInfo was called AFTER setWebhook
+  const infoCallIndex = calls.findIndex((c) => c.method === 'getWebhookInfo');
+  const setCallIndex = calls.findIndex((c) => c.method === 'setWebhook');
+  assert.ok(infoCallIndex > setCallIndex, 'getWebhookInfo must be called after setWebhook');
+
+  // Ensure MASTER_BOT_TOKEN and MASTER_WEBHOOK_SECRET are NEVER exposed in frontend response
+  assert.ok(!regText.includes(env.MASTER_BOT_TOKEN), 'MASTER_BOT_TOKEN must never appear in response');
+  assert.ok(!regText.includes(env.MASTER_WEBHOOK_SECRET), 'MASTER_WEBHOOK_SECRET must never appear in response');
+
+  // Persisted status endpoint reflects verified state and last registration timestamp
+  const afterRes = await routeRequest(
+    new Request(`${workerUrl}/api/master/webhook-status`, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${env.ADMIN_API_KEY}` },
+    }),
+    env,
+    {},
+    { fetchImpl }
+  );
+  assert.equal(afterRes.status, 200);
+  const afterText = await afterRes.text();
+  const afterBody = JSON.parse(afterText);
+  assert.equal(afterBody.webhook.status, 'verified');
+  assert.equal(afterBody.webhook.verified, true);
+  assert.equal(afterBody.webhook.lastRegisteredAt, regBody.lastRegisteredAt);
+  assert.ok(!afterText.includes(env.MASTER_BOT_TOKEN));
+  assert.ok(!afterText.includes(env.MASTER_WEBHOOK_SECRET));
+});
+
+test('Master Bot manual verification detects exact match and URL mismatch cleanly', async () => {
+  const workerUrl = 'https://botfactory.rimpirimpi141.workers.dev';
+  const env = buildTestEnv({ WORKER_PUBLIC_URL: workerUrl });
+
+  // 1. Mismatch scenario: Telegram reports an outdated URL
+  const mismatchMock = createMockTelegramFetch({
+    getWebhookInfo: async () => ({
+      status: 200,
+      body: {
+        ok: true,
+        result: {
+          url: 'https://old-worker.example.workers.dev/webhook/master',
+          pending_update_count: 3,
+          max_connections: 40,
+          allowed_updates: ['message', 'callback_query'],
+        },
+      },
+    }),
+  });
+
+  const mismatchRes = await routeRequest(
+    new Request(`${workerUrl}/api/master/verify-webhook`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${env.ADMIN_API_KEY}` },
+    }),
+    env,
+    {},
+    { fetchImpl: mismatchMock.fetchImpl }
+  );
+  assert.equal(mismatchRes.status, 200);
+  const mismatchBody = await mismatchRes.json();
+  assert.equal(mismatchBody.verified, false);
+  assert.equal(mismatchBody.status, 'mismatch');
+  assert.match(mismatchBody.error, /mismatch/i);
+
+  // Registration must also fail if getWebhookInfo does not match the registered URL
+  const badRegRes = await routeRequest(
+    new Request(`${workerUrl}/api/master/register-webhook`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${env.ADMIN_API_KEY}` },
+    }),
+    env,
+    {},
+    { fetchImpl: mismatchMock.fetchImpl }
+  );
+  assert.equal(badRegRes.status, 502);
+  const badRegBody = await badRegRes.json();
+  assert.equal(badRegBody.ok, false);
+  assert.equal(badRegBody.status, 'failed');
+  assert.match(badRegBody.error, /mismatch/i);
+
+  // 2. Exact match scenario: Telegram reports the exact expected URL
+  const matchMock = createMockTelegramFetch({
+    getWebhookInfo: async () => ({
+      status: 200,
+      body: {
+        ok: true,
+        result: {
+          url: `${workerUrl}/webhook/master`,
+          pending_update_count: 0,
+          max_connections: 40,
+          allowed_updates: ['message', 'callback_query'],
+        },
+      },
+    }),
+  });
+
+  const matchRes = await routeRequest(
+    new Request(`${workerUrl}/api/master/verify-webhook`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${env.ADMIN_API_KEY}` },
+    }),
+    env,
+    {},
+    { fetchImpl: matchMock.fetchImpl }
+  );
+  assert.equal(matchRes.status, 200);
+  const matchBody = await matchRes.json();
+  assert.equal(matchBody.verified, true);
+  assert.equal(matchBody.status, 'verified');
+});
+
+// ============================================================================
+// 9. TENANT BOTS — AUTOMATIC WEBHOOK, UNIQUE SECRETS & API CREDENTIAL SAFETY
+// ============================================================================
+test('Tenant bot automatic webhook uses /webhook/{botId}, unique secret per bot, verifies before active, and strips secrets from all API responses', async () => {
+  const workerUrl = 'https://botfactory.rimpirimpi141.workers.dev';
+  const env = buildTestEnv({ WORKER_PUBLIC_URL: workerUrl });
+  const { fetchImpl, calls } = createMockTelegramFetch();
+
+  const token1 = '6100001:AAH_AutoTenantOne_ValidToken_1234567890abc';
+  const token2 = '6100002:AAH_AutoTenantTwo_ValidToken_1234567890abc';
+
+  const deployRes1 = await routeRequest(
+    new Request(`${workerUrl}/api/bots/deploy`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${env.ADMIN_API_KEY}` },
+      body: JSON.stringify({
+        token: token1,
+        templateId: 'tpl_refer_earn',
+        displayName: 'Auto Tenant One',
+        ownerTelegramId: '5010',
+      }),
+    }),
+    env,
+    {},
+    { fetchImpl }
+  );
+  assert.equal(deployRes1.status, 201);
+  const deployText1 = await deployRes1.text();
+  const deployBody1 = JSON.parse(deployText1);
+
+  const deployRes2 = await routeRequest(
+    new Request(`${workerUrl}/api/bots/deploy`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${env.ADMIN_API_KEY}` },
+      body: JSON.stringify({
+        token: token2,
+        templateId: 'tpl_tool_bot',
+        displayName: 'Auto Tenant Two',
+        ownerTelegramId: '5020',
+      }),
+    }),
+    env,
+    {},
+    { fetchImpl }
+  );
+  assert.equal(deployRes2.status, 201);
+  const deployBody2 = JSON.parse(await deployRes2.text());
+
+  // Verify exact tenant webhook URLs and active status only after verification
+  assert.equal(deployBody1.bot.status, 'active');
+  assert.equal(deployBody1.bot.webhook_status, 'verified');
+  assert.equal(deployBody1.verification.webhookUrl, `${workerUrl}/webhook/${deployBody1.bot.id}`);
+  assert.equal(deployBody2.verification.webhookUrl, `${workerUrl}/webhook/${deployBody2.bot.id}`);
+
+  // Verify setWebhook was called with unique secrets per tenant bot
+  const setCalls = calls.filter((c) => c.method === 'setWebhook');
+  assert.equal(setCalls.length, 2);
+  assert.equal(setCalls[0].body.url, `${workerUrl}/webhook/${deployBody1.bot.id}`);
+  assert.equal(setCalls[1].body.url, `${workerUrl}/webhook/${deployBody2.bot.id}`);
+  assert.ok(setCalls[0].body.secret_token.length === 64);
+  assert.ok(setCalls[1].body.secret_token.length === 64);
+  assert.notEqual(setCalls[0].body.secret_token, setCalls[1].body.secret_token);
+  assert.notEqual(setCalls[0].body.secret_token, env.MASTER_WEBHOOK_SECRET);
+
+  // Verify NO bot token or webhook secret is exposed in deploy, disable, enable, list, or detail APIs
+  assert.equal(deployBody1.bot.token_encrypted, undefined);
+  assert.equal(deployBody1.bot.token_hash, undefined);
+  assert.equal(deployBody1.bot.webhook_secret, undefined);
+  assert.ok(!deployText1.includes(token1));
+  assert.ok(!deployText1.includes(setCalls[0].body.secret_token));
+
+  const disableRes = await routeRequest(
+    new Request(`${workerUrl}/api/bots/${deployBody1.bot.id}/disable`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${env.ADMIN_API_KEY}` },
+    }),
+    env,
+    {},
+    { fetchImpl }
+  );
+  const disableBody = await disableRes.json();
+  assert.equal(disableBody.bot.token_encrypted, undefined);
+  assert.equal(disableBody.bot.webhook_secret, undefined);
+
+  const enableRes = await routeRequest(
+    new Request(`${workerUrl}/api/bots/${deployBody1.bot.id}/enable`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${env.ADMIN_API_KEY}` },
+    }),
+    env,
+    {},
+    { fetchImpl }
+  );
+  const enableBody = await enableRes.json();
+  assert.equal(enableBody.bot.status, 'active');
+  assert.equal(enableBody.bot.token_encrypted, undefined);
+  assert.equal(enableBody.bot.webhook_secret, undefined);
+
+  // Verify token is stored encrypted (never plaintext) in D1
+  const db = createDbClient(env.DB);
+  const repos = createRepositories(db, env);
+  const rawDbRow = await repos.bots.getById(deployBody1.bot.id);
+  assert.ok(rawDbRow.token_encrypted.startsWith('v1:'));
+  assert.ok(!rawDbRow.token_encrypted.includes(token1));
+});
+
+// ============================================================================
+// 10. FAILURE HANDLING, SAFE RETRY & DUPLICATE PROTECTION
+// ============================================================================
+test('Failed setWebhook or verification mismatch does not activate bot, records error, and allows safe retry without duplicates', async () => {
+  const workerUrl = 'https://botfactory.rimpirimpi141.workers.dev';
+  const env = buildTestEnv({ WORKER_PUBLIC_URL: workerUrl });
+  const db = createDbClient(env.DB);
+  const repos = createRepositories(db, env);
+  const rawToken = '6200001:AAH_RetryableBot_ValidToken_1234567890abcd';
+
+  // Attempt 1: setWebhook fails with Telegram 400 error
+  const failSetMock = createMockTelegramFetch({
+    setWebhook: async () => ({
+      status: 400,
+      body: { ok: false, error_code: 400, description: 'Bad Request: failed to resolve host' },
+    }),
+  });
+  await assert.rejects(
+    () =>
+      deployTenantBot({
+        env,
+        repos,
+        telegram: createTelegramClient(failSetMock.fetchImpl),
+        ownerTelegramId: '8881',
+        rawToken,
+        templateId: 'tpl_tool_bot',
+        displayName: 'Retry Bot',
+      }),
+    /failed to resolve host/i
+  );
+
+  // Verify bot was NOT marked active and meaningful error was saved
+  let allBots = await repos.bots.listAll();
+  assert.equal(allBots.length, 1);
+  const firstBotId = allBots[0].id;
+  assert.equal(allBots[0].status, 'failed');
+  assert.equal(allBots[0].webhook_status, 'failed');
+  assert.match(allBots[0].webhook_last_error, /failed to resolve host/i);
+
+  // Another user trying to steal/duplicate the failed bot token is BLOCKED
+  const okMock = createMockTelegramFetch();
+  await assert.rejects(
+    () =>
+      deployTenantBot({
+        env,
+        repos,
+        telegram: createTelegramClient(okMock.fetchImpl),
+        ownerTelegramId: '9999',
+        rawToken,
+        templateId: 'tpl_tool_bot',
+        displayName: 'Unauthorized Hijack Attempt',
+      }),
+    /already registered/i
+  );
+
+  // Attempt 2: Same owner retries safely — getWebhookInfo returns mismatch (still must NOT activate)
+  const mismatchMock = createMockTelegramFetch({
+    getWebhookInfo: async () => ({
+      status: 200,
+      body: { ok: true, result: { url: 'https://wrong.example.com/webhook/other', pending_update_count: 0 } },
+    }),
+  });
+  await assert.rejects(
+    () =>
+      deployTenantBot({
+        env,
+        repos,
+        telegram: createTelegramClient(mismatchMock.fetchImpl),
+        ownerTelegramId: '8881',
+        rawToken,
+        templateId: 'tpl_tool_bot',
+        displayName: 'Retry Bot',
+      }),
+    /verification mismatch/i
+  );
+
+  allBots = await repos.bots.listAll();
+  assert.equal(allBots.length, 1, 'Safe retry must NOT create duplicate bot rows');
+  assert.equal(allBots[0].id, firstBotId);
+  assert.equal(allBots[0].status, 'failed');
+  assert.match(allBots[0].webhook_last_error, /mismatch/i);
+
+  // Attempt 3: Same owner retries when Telegram succeeds -> reuses bot ID and activates cleanly!
+  const successRetry = await deployTenantBot({
+    env,
+    repos,
+    telegram: createTelegramClient(okMock.fetchImpl),
+    ownerTelegramId: '8881',
+    rawToken,
+    templateId: 'tpl_tool_bot',
+    displayName: 'Retry Bot',
+  });
+  assert.equal(successRetry.retried, true);
+  assert.equal(successRetry.bot.id, firstBotId);
+  assert.equal(successRetry.bot.status, 'active');
+  assert.equal(successRetry.bot.webhook_status, 'verified');
+
+  allBots = await repos.bots.listAll();
+  assert.equal(allBots.length, 1, 'Database must still contain exactly one bot row after safe retry');
+
+  // Once active, even the same owner cannot create a duplicate deployment
+  await assert.rejects(
+    () =>
+      deployTenantBot({
+        env,
+        repos,
+        telegram: createTelegramClient(okMock.fetchImpl),
+        ownerTelegramId: '8881',
+        rawToken,
+        templateId: 'tpl_tool_bot',
+        displayName: 'Duplicate Active Attempt',
+      }),
+    /already registered/i
+  );
+});
+
+// ============================================================================
+// 11. NETWORK TIMEOUT & TENANT WEBHOOK SECRET HEADER ISOLATION
+// ============================================================================
+test('Network timeout during Telegram webhook registration returns clean 504 error and never activates bot', async () => {
+  const workerUrl = 'https://botfactory.rimpirimpi141.workers.dev';
+  const env = buildTestEnv({ WORKER_PUBLIC_URL: workerUrl });
+
+  const hangingFetch = async (url, init = {}) => {
+    const match = String(url).match(/\/bot([^/]+)\/([A-Za-z0-9_]+)$/);
+    const method = match?.[2] || '';
+    if (method === 'getMe') {
+      return new Response(
+        JSON.stringify({ ok: true, result: { id: 6300001, is_bot: true, first_name: 'Timeout Bot', username: 'timeout_bot' } }),
+        { status: 200 }
+      );
+    }
+    // Hang until AbortController fires
+    return new Promise((_, reject) => {
+      init.signal?.addEventListener('abort', () => {
+        const err = new Error('The operation was aborted');
+        err.name = 'AbortError';
+        reject(err);
+      });
+    });
+  };
+
+  const res = await routeRequest(
+    new Request(`${workerUrl}/api/bots/deploy`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${env.ADMIN_API_KEY}` },
+      body: JSON.stringify({
+        token: '6300001:AAH_TimeoutBot_ValidToken_1234567890abcdef',
+        templateId: 'tpl_tool_bot',
+        displayName: 'Timeout Bot',
+      }),
+    }),
+    env,
+    {},
+    { fetchImpl: hangingFetch, telegramTimeoutMs: 40 }
+  );
+  assert.equal(res.status, 504);
+  const body = await res.json();
+  assert.equal(body.ok, false);
+  assert.match(body.error, /timeout/i);
+
+  // Confirm bot was NOT activated in D1
+  const db = createDbClient(env.DB);
+  const repos = createRepositories(db, env);
+  const bots = await repos.bots.listAll();
+  assert.equal(bots.length, 1);
+  assert.equal(bots[0].status, 'failed');
+  assert.equal(bots[0].webhook_status, 'failed');
+  assert.match(bots[0].webhook_last_error, /timeout/i);
+});
+
+test('Incoming tenant webhook rejects missing, wrong, master, and cross-tenant secrets with 401', async () => {
+  const workerUrl = 'https://botfactory.rimpirimpi141.workers.dev';
+  const env = buildTestEnv({ WORKER_PUBLIC_URL: workerUrl });
+  const db = createDbClient(env.DB);
+  const repos = createRepositories(db, env);
+  const { fetchImpl } = createMockTelegramFetch();
+  const telegram = createTelegramClient(fetchImpl);
+
+  const botA = await deployTenantBot({
+    env,
+    repos,
+    telegram,
+    ownerTelegramId: '7001',
+    rawToken: '6400001:AAH_SecTenantA_ValidToken_1234567890abcdef',
+    templateId: 'tpl_tool_bot',
+    displayName: 'Sec Tenant A',
+  });
+  const botB = await deployTenantBot({
+    env,
+    repos,
+    telegram,
+    ownerTelegramId: '7002',
+    rawToken: '6400002:AAH_SecTenantB_ValidToken_1234567890abcdef',
+    templateId: 'tpl_tool_bot',
+    displayName: 'Sec Tenant B',
+  });
+
+  const payload = JSON.stringify({
+    update_id: 901,
+    message: { chat: { id: 12345, type: 'private' }, from: { id: 12345, first_name: 'Tester' }, text: '/start' },
+  });
+
+  // 1. Missing header -> 401
+  const missingRes = await routeRequest(
+    new Request(`${workerUrl}/webhook/${botA.bot.id}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: payload,
+    }),
+    env,
+    {},
+    { fetchImpl }
+  );
+  assert.equal(missingRes.status, 401);
+
+  // 2. Master Bot secret used on Tenant Bot -> 401
+  const masterSecretRes = await routeRequest(
+    new Request(`${workerUrl}/webhook/${botA.bot.id}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Telegram-Bot-Api-Secret-Token': env.MASTER_WEBHOOK_SECRET },
+      body: payload,
+    }),
+    env,
+    {},
+    { fetchImpl }
+  );
+  assert.equal(masterSecretRes.status, 401);
+
+  // 3. Bot B's secret used on Bot A's webhook -> 401
+  const crossTenantRes = await routeRequest(
+    new Request(`${workerUrl}/webhook/${botA.bot.id}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Telegram-Bot-Api-Secret-Token': botB.bot.webhook_secret },
+      body: payload,
+    }),
+    env,
+    {},
+    { fetchImpl }
+  );
+  assert.equal(crossTenantRes.status, 401);
+
+  // 4. Bot A's own secret -> 200 OK
+  const validRes = await routeRequest(
+    new Request(`${workerUrl}/webhook/${botA.bot.id}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Telegram-Bot-Api-Secret-Token': botA.bot.webhook_secret },
+      body: payload,
+    }),
+    env,
+    {},
+    { fetchImpl }
+  );
+  assert.equal(validRes.status, 200);
+});

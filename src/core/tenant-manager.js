@@ -103,8 +103,16 @@ export async function loadTenantRuntime({ env, repos, botId }) {
 
 /**
  * Validates a Telegram bot token via real Telegram getMe + checks for duplicate registration.
+ * When `allowRetryFailed` is true and the existing failed record belongs to the same owner,
+ * returns `retryBotId` so deployment can safely retry without creating duplicate rows.
  */
-export async function validateTokenForDeployment({ telegram, repos, rawToken }) {
+export async function validateTokenForDeployment({
+  telegram,
+  repos,
+  rawToken,
+  ownerTelegramId = null,
+  allowRetryFailed = false,
+}) {
   const format = validateBotTokenFormat(rawToken);
   if (!format.valid) {
     throw new Error(format.error);
@@ -118,10 +126,22 @@ export async function validateTokenForDeployment({ telegram, repos, rawToken }) 
 
   const tokenHash = await hashBotToken(format.token);
   const duplicate = await repos.bots.findDuplicate(String(botInfo.id), tokenHash);
+  let retryBotId = null;
+
   if (duplicate) {
-    throw new Error(
-      `Bot @${botInfo.username} is already registered on BOT FACTORY (ID: ${duplicate.id}). Delete or manage the existing instance instead.`
-    );
+    const sameOwner = ownerTelegramId !== null && String(duplicate.owner_telegram_id) === String(ownerTelegramId);
+
+    if (duplicate.status === 'failed' && allowRetryFailed && sameOwner) {
+      retryBotId = duplicate.id;
+    } else if (duplicate.status === 'deploying') {
+      throw new Error(
+        `Deployment for @${botInfo.username} (${duplicate.id}) is already in progress. Please wait a moment before retrying.`
+      );
+    } else {
+      throw new Error(
+        `Bot @${botInfo.username} is already registered on BOT FACTORY (ID: ${duplicate.id}). Delete or manage the existing instance instead.`
+      );
+    }
   }
 
   return {
@@ -130,12 +150,14 @@ export async function validateTokenForDeployment({ telegram, repos, rawToken }) 
     telegramBotId: String(botInfo.id),
     telegramUsername: botInfo.username,
     telegramFirstName: botInfo.first_name || botInfo.username,
+    retryBotId,
   };
 }
 
 /**
  * Complete real multi-tenant bot deployment pipeline.
  * Only marks bot ACTIVE after setWebhook + getWebhookInfo succeed.
+ * Safely retries existing failed deployments owned by the same creator without duplicating records.
  */
 export async function deployTenantBot({
   env,
@@ -159,7 +181,13 @@ export async function deployTenantBot({
 
   // Stage 1: Validate token via real Telegram getMe
   await notify('validate_token', 'Contacting Telegram getMe...');
-  const validated = await validateTokenForDeployment({ telegram, repos, rawToken });
+  const validated = await validateTokenForDeployment({
+    telegram,
+    repos,
+    rawToken,
+    ownerTelegramId,
+    allowRetryFailed: true,
+  });
 
   // Stage 2: Check template & owner quotas
   await notify('load_template', 'Loading template definition...');
@@ -192,30 +220,50 @@ export async function deployTenantBot({
     throw new Error(supportCheck.error);
   }
 
-  // Stage 3: Encrypt bot token with AES-256-GCM
-  await notify('encrypt_credentials', 'Encrypting credentials with AES-GCM...');
+  // Stage 3: Encrypt bot token with AES-256-GCM and generate unique per-bot webhook secret
+  await notify('encrypt_credentials', 'Encrypting credentials with AES-256-GCM...');
   const tokenEncrypted = await encryptBotToken(validated.token, env.TOKEN_ENCRYPTION_KEY);
-  const botId = generateBotId();
+  const botId = validated.retryBotId || generateBotId();
   const webhookSecret = generateWebhookSecret();
   const webhookUrl = buildTenantWebhookUrl(env.WORKER_PUBLIC_URL, botId);
+  const resolvedMode = template.slug === 'custom-builder' ? 'custom' : mode;
 
-  // Stage 4: Persist bot & configuration in Cloudflare D1
-  await notify('save_database', 'Persisting tenant configuration to D1...');
-  await repos.bots.create({
-    id: botId,
-    ownerTelegramId: String(ownerTelegramId),
-    telegramBotId: validated.telegramBotId,
-    telegramUsername: validated.telegramUsername,
-    displayName: displayName || validated.telegramFirstName,
-    description,
-    tokenEncrypted,
-    tokenHash: validated.tokenHash,
-    webhookSecret,
-    webhookUrl,
-    templateId: template.id,
-    mode: template.slug === 'custom-builder' ? 'custom' : mode,
-    plan: owner?.plan || 'free',
-  });
+  // Stage 4: Persist bot & configuration in Cloudflare D1 (update in-place when safely retrying a failed deploy)
+  await notify(
+    'save_database',
+    validated.retryBotId ? 'Updating failed deployment record in D1 for safe retry...' : 'Persisting tenant configuration to D1...'
+  );
+
+  if (validated.retryBotId) {
+    await repos.bots.prepareRetryDeployment(botId, {
+      telegramUsername: validated.telegramUsername,
+      displayName: displayName || validated.telegramFirstName,
+      description,
+      tokenEncrypted,
+      tokenHash: validated.tokenHash,
+      webhookSecret,
+      webhookUrl,
+      templateId: template.id,
+      mode: resolvedMode,
+      plan: owner?.plan || 'free',
+    });
+  } else {
+    await repos.bots.create({
+      id: botId,
+      ownerTelegramId: String(ownerTelegramId),
+      telegramBotId: validated.telegramBotId,
+      telegramUsername: validated.telegramUsername,
+      displayName: displayName || validated.telegramFirstName,
+      description,
+      tokenEncrypted,
+      tokenHash: validated.tokenHash,
+      webhookSecret,
+      webhookUrl,
+      templateId: template.id,
+      mode: resolvedMode,
+      plan: owner?.plan || 'free',
+    });
+  }
 
   await repos.botConfigs.upsert(botId, {
     brandTitle: branding.brandTitle || displayName || validated.telegramFirstName,
@@ -240,8 +288,8 @@ export async function deployTenantBot({
     await repos.menus.replaceMenuTree(botId, customMenus);
   }
 
-  // Stage 5 & 6: Register and verify webhook through Telegram API
-  await notify('register_webhook', 'Registering Telegram webhook...');
+  // Stage 5 & 6: Automatically register and verify webhook through Telegram API
+  await notify('register_webhook', 'Registering tenant Telegram webhook...');
   try {
     const verification = await registerAndVerifyWebhook({
       telegram,
@@ -262,8 +310,8 @@ export async function deployTenantBot({
     await writeSystemLog(env, {
       level: 'audit',
       source: 'tenant-manager',
-      message: `Deployed and verified bot @${validated.telegramUsername} (${botId})`,
-      metadata: { botId, templateId: template.id, webhookUrl },
+      message: `${validated.retryBotId ? 'Retried and verified' : 'Deployed and verified'} bot @${validated.telegramUsername} (${botId})`,
+      metadata: { botId, templateId: template.id, webhookUrl, retried: Boolean(validated.retryBotId) },
       actorTelegramId: ownerTelegramId,
     });
 
@@ -271,6 +319,7 @@ export async function deployTenantBot({
       bot: activeBot,
       template,
       verification,
+      retried: Boolean(validated.retryBotId),
     };
   } catch (webhookErr) {
     await repos.bots.updateWebhookVerification(botId, {
@@ -313,28 +362,47 @@ export async function enableAndVerifyTenantBot({ env, repos, telegram, botId, ac
   if (!runtime) throw new Error('Bot not found.');
 
   const webhookUrl = buildTenantWebhookUrl(env.WORKER_PUBLIC_URL, botId);
-  const verification = await registerAndVerifyWebhook({
-    telegram,
-    token: runtime.token,
-    webhookUrl,
-    secretToken: runtime.bot.webhook_secret,
-  });
 
-  const updated = await repos.bots.updateWebhookVerification(botId, {
-    webhookUrl: verification.webhookUrl,
-    webhookStatus: 'verified',
-    botStatus: 'active',
-    error: verification.lastErrorMessage,
-  });
-  await invalidateTenantCache(env, botId);
-  await writeSystemLog(env, {
-    level: 'audit',
-    source: 'tenant-manager',
-    message: `Re-enabled and verified bot @${runtime.bot.telegram_username} (${botId})`,
-    metadata: { botId, webhookUrl },
-    actorTelegramId,
-  });
-  return { bot: updated, verification };
+  try {
+    const verification = await registerAndVerifyWebhook({
+      telegram,
+      token: runtime.token,
+      webhookUrl,
+      secretToken: runtime.bot.webhook_secret,
+    });
+
+    const updated = await repos.bots.updateWebhookVerification(botId, {
+      webhookUrl: verification.webhookUrl,
+      webhookStatus: 'verified',
+      botStatus: 'active',
+      error: verification.lastErrorMessage,
+    });
+    await invalidateTenantCache(env, botId);
+    await writeSystemLog(env, {
+      level: 'audit',
+      source: 'tenant-manager',
+      message: `Re-enabled and verified bot @${runtime.bot.telegram_username} (${botId})`,
+      metadata: { botId, webhookUrl },
+      actorTelegramId,
+    });
+    return { bot: updated, verification };
+  } catch (webhookErr) {
+    await repos.bots.updateWebhookVerification(botId, {
+      webhookUrl,
+      webhookStatus: 'failed',
+      botStatus: 'failed',
+      error: webhookErr?.message || 'Webhook retry verification failed',
+    });
+    await invalidateTenantCache(env, botId);
+    await writeSystemLog(env, {
+      level: 'error',
+      source: 'tenant-manager',
+      message: `Webhook retry failed for ${botId}: ${webhookErr?.message}`,
+      metadata: { botId },
+      actorTelegramId,
+    });
+    throw webhookErr;
+  }
 }
 
 export async function deleteTenantBot({ env, repos, telegram, botId, actorTelegramId }) {

@@ -11,21 +11,26 @@
 import { redactString } from '../utils/logger.js';
 
 const TELEGRAM_API_BASE = 'https://api.telegram.org';
+const DEFAULT_TELEGRAM_TIMEOUT_MS = 12000;
 
 export class TelegramApiError extends Error {
-  constructor(message, { status = 500, errorCode = null, retryAfter = null, isBlocked = false, method = '' } = {}) {
+  constructor(
+    message,
+    { status = 500, errorCode = null, retryAfter = null, isBlocked = false, isTimeout = false, method = '' } = {}
+  ) {
     super(redactString(message));
     this.name = 'TelegramApiError';
     this.status = status;
     this.errorCode = errorCode;
     this.retryAfter = retryAfter;
     this.isBlocked = isBlocked;
+    this.isTimeout = isTimeout;
     this.method = method;
   }
 }
 
-export function createTelegramClient(fetchImpl = globalThis.fetch) {
-  async function call(token, method, payload = {}, { maxRetries = 1 } = {}) {
+export function createTelegramClient(fetchImpl = globalThis.fetch, { timeoutMs: defaultTimeoutMs = DEFAULT_TELEGRAM_TIMEOUT_MS } = {}) {
+  async function call(token, method, payload = {}, { maxRetries = 1, timeoutMs = defaultTimeoutMs } = {}) {
     if (!token) {
       throw new TelegramApiError('Telegram bot token is required.', { status: 400, method });
     }
@@ -36,17 +41,39 @@ export function createTelegramClient(fetchImpl = globalThis.fetch) {
     while (attempt <= maxRetries) {
       attempt += 1;
       let response;
+      const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+      const effectiveTimeout = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : DEFAULT_TELEGRAM_TIMEOUT_MS;
+      const timer = controller ? setTimeout(() => controller.abort(), effectiveTimeout) : null;
+
       try {
         response = await fetchImpl(url, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(cleanUndefined(payload)),
+          signal: controller?.signal,
         });
       } catch (networkErr) {
+        const isAbort =
+          networkErr?.name === 'AbortError' ||
+          /aborted|timed?\s*out/i.test(String(networkErr?.message || ''));
+        if (isAbort) {
+          throw new TelegramApiError(
+            `Network timeout calling Telegram ${method} after ${effectiveTimeout}ms. Please retry.`,
+            {
+              status: 504,
+              errorCode: 504,
+              isTimeout: true,
+              method,
+            }
+          );
+        }
         throw new TelegramApiError(`Network error calling Telegram ${method}: ${networkErr?.message || 'unreachable'}`, {
           status: 502,
+          errorCode: 502,
           method,
         });
+      } finally {
+        if (timer) clearTimeout(timer);
       }
 
       let data;

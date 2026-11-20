@@ -48,7 +48,9 @@ export function SetupModal({ open, connection, health, onClose, onConnected }: S
     try {
       const api = createWorkerApi({ workerUrl, adminApiKey });
       const res = await api.registerMasterWebhook();
-      setMasterMsg(`Verified Master Bot @${res.bot.username} -> ${res.verification.webhookUrl}`);
+      setMasterMsg(
+        `Verified Master Bot @${res.bot?.username || 'master'} -> ${res.verification?.webhookUrl || res.expectedWebhookUrl}`
+      );
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Master webhook registration failed');
     } finally {
@@ -112,7 +114,7 @@ npm run worker:deploy`;
                 required
                 value={workerUrl}
                 onChange={(e) => setWorkerUrl(e.target.value)}
-                placeholder="https://bot-factory.your-subdomain.workers.dev"
+                placeholder="https://botfactory.rimpirimpi141.workers.dev"
                 className="w-full rounded-lg border border-slate-700 bg-[#070B14] px-3.5 py-2.5 font-mono text-xs text-slate-100 placeholder-slate-500 focus:border-blue-500 focus:outline-none"
               />
             </div>

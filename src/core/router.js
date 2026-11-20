@@ -19,7 +19,13 @@ import {
   invalidateTenantCache,
   validateTokenForDeployment,
 } from './tenant-manager.js';
-import { buildMasterWebhookUrl, registerAndVerifyWebhook, verifyWebhookSecretHeader } from './webhook-manager.js';
+import {
+  buildMasterWebhookUrl,
+  inspectWebhookStatus,
+  MASTER_BOT_ALLOWED_UPDATES,
+  registerAndVerifyWebhook,
+  verifyWebhookSecretHeader,
+} from './webhook-manager.js';
 import { timingSafeEqual } from './token-security.js';
 import { validateMenuTree } from '../builder/menu-builder.js';
 import { listThemePresets } from '../builder/theme-engine.js';
@@ -41,7 +47,7 @@ import {
 } from '../admin/bot-management.js';
 import { changeUserPlan, getUserProfileDetail, listUsers, setUserSuspension } from '../admin/user-management.js';
 import { validateBotId } from '../utils/validation.js';
-import { writeSystemLog } from '../utils/logger.js';
+import { redactString, writeSystemLog } from '../utils/logger.js';
 
 function corsHeaders(env) {
   return {
@@ -62,6 +68,32 @@ function jsonResponse(data, status = 200, env = {}) {
   });
 }
 
+function sanitizeBotForApi(bot) {
+  if (!bot) return null;
+  const safe = { ...bot };
+  delete safe.token_encrypted;
+  delete safe.token_hash;
+  delete safe.webhook_secret;
+  return safe;
+}
+
+function resolveWorkerPublicUrl(env, requestUrl) {
+  const configured = String(env?.WORKER_PUBLIC_URL || '').trim().replace(/\/+$/, '');
+  if (configured && /^https:\/\/.+/i.test(configured) && !configured.includes('YOUR-SUBDOMAIN')) {
+    return configured;
+  }
+  return requestUrl.origin.replace(/\/+$/, '');
+}
+
+function parseJsonSetting(raw) {
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
 function verifyOwnerApiAuth(request, env) {
   const configuredKey = env?.ADMIN_API_KEY;
   if (!configuredKey) return { authorized: false, reason: 'ADMIN_API_KEY secret is not configured on this Worker.' };
@@ -74,7 +106,7 @@ function verifyOwnerApiAuth(request, env) {
   return { authorized: true };
 }
 
-export async function routeRequest(request, env, ctx, { fetchImpl = globalThis.fetch } = {}) {
+export async function routeRequest(request, env, ctx, { fetchImpl = globalThis.fetch, telegramTimeoutMs } = {}) {
   const url = new URL(request.url);
   const path = url.pathname.replace(/\/+$/, '') || '/';
   const method = request.method.toUpperCase();
@@ -83,7 +115,14 @@ export async function routeRequest(request, env, ctx, { fetchImpl = globalThis.f
     return new Response(null, { status: 204, headers: corsHeaders(env) });
   }
 
-  const telegram = createTelegramClient(fetchImpl);
+  const telegram = createTelegramClient(
+    fetchImpl,
+    telegramTimeoutMs ? { timeoutMs: telegramTimeoutMs } : undefined
+  );
+  const workerPublicUrl = resolveWorkerPublicUrl(env, url);
+  const expectedMasterWebhookUrl = /^https:\/\/.+/i.test(workerPublicUrl)
+    ? buildMasterWebhookUrl(workerPublicUrl)
+    : `${workerPublicUrl}/webhook/master`;
 
   // Public Health Endpoint (zero secrets leaked)
   if (method === 'GET' && (path === '/' || path === '/api/health')) {
@@ -103,11 +142,14 @@ export async function routeRequest(request, env, ctx, { fetchImpl = globalThis.f
         tagline: 'Build. Customize. Deploy.',
         status: dbHealth.healthy ? 'operational' : 'setup_required',
         timestamp: new Date().toISOString(),
+        workerPublicUrl,
+        expectedMasterWebhookUrl,
         bindings: {
           d1: dbHealth,
           kv: Boolean(env?.KV),
           analyticsEngine: Boolean(env?.ANALYTICS),
           masterBotConfigured: Boolean(env?.MASTER_BOT_TOKEN),
+          masterWebhookSecretConfigured: Boolean(env?.MASTER_WEBHOOK_SECRET),
           encryptionKeyConfigured: Boolean(env?.TOKEN_ENCRYPTION_KEY),
           ownerIdConfigured: Boolean(env?.ADMIN_TELEGRAM_ID && !String(env.ADMIN_TELEGRAM_ID).includes('REPLACE_WITH')),
           adminApiKeyConfigured: Boolean(env?.ADMIN_API_KEY),
@@ -152,7 +194,12 @@ export async function routeRequest(request, env, ctx, { fetchImpl = globalThis.f
     }
 
     try {
-      const result = await handleMasterBotUpdate({ env, repos, telegram, update });
+      const result = await handleMasterBotUpdate({
+        env: { ...env, WORKER_PUBLIC_URL: workerPublicUrl },
+        repos,
+        telegram,
+        update,
+      });
       return jsonResponse({ ok: true, result }, 200, env);
     } catch (err) {
       await writeSystemLog(env, {
@@ -220,24 +267,264 @@ export async function routeRequest(request, env, ctx, { fetchImpl = globalThis.f
     const ownerId = String(env.ADMIN_TELEGRAM_ID || 'owner_api');
 
     try {
-      // Master Bot Webhook auto-registration
+      // Master Bot Webhook Status (non-secret configuration & persisted last registration metadata)
+      if (method === 'GET' && path === '/api/master/webhook-status') {
+        const settings = await repos.stats.getSettings();
+        const sMap = settings.map || {};
+        const configuredUsername =
+          sMap.master_bot_username ||
+          (env.MASTER_BOT_USERNAME && !String(env.MASTER_BOT_USERNAME).includes('REPLACE_WITH')
+            ? String(env.MASTER_BOT_USERNAME).replace(/^@/, '')
+            : null);
+
+        const basePayload = {
+          ok: true,
+          configuration: {
+            masterBotTokenConfigured: Boolean(env.MASTER_BOT_TOKEN),
+            masterWebhookSecretConfigured: Boolean(env.MASTER_WEBHOOK_SECRET),
+            readyForRegistration: Boolean(env.MASTER_BOT_TOKEN && env.MASTER_WEBHOOK_SECRET),
+            masterBotUsername: configuredUsername,
+            workerPublicUrl,
+            expectedWebhookUrl: expectedMasterWebhookUrl,
+            allowedUpdates: MASTER_BOT_ALLOWED_UPDATES,
+          },
+          webhook: {
+            status: sMap.master_webhook_last_status || 'not_registered',
+            verified: sMap.master_webhook_last_status === 'verified',
+            lastRegisteredAt: sMap.master_webhook_last_registered_at || null,
+            lastVerifiedAt: sMap.master_webhook_last_verified_at || null,
+            lastError: sMap.master_webhook_last_error || null,
+            telegramResponse: parseJsonSetting(sMap.master_webhook_last_response),
+          },
+        };
+
+        if (url.searchParams.get('live') === 'true' && env.MASTER_BOT_TOKEN) {
+          const webhookUrl = buildMasterWebhookUrl(workerPublicUrl);
+          const me = await telegram.getMe(env.MASTER_BOT_TOKEN);
+          const inspection = await inspectWebhookStatus({
+            telegram,
+            token: env.MASTER_BOT_TOKEN,
+            expectedUrl: webhookUrl,
+          });
+          const now = inspection.checkedAt;
+          const mismatchErr =
+            inspection.status === 'mismatch'
+              ? `Webhook URL mismatch: Telegram reported "${inspection.actualUrl}" instead of "${webhookUrl}".`
+              : inspection.lastErrorMessage || '';
+
+          await Promise.all([
+            repos.stats.setSetting('master_bot_username', me.result.username || '', ownerId),
+            repos.stats.setSetting('master_webhook_last_verified_at', now, ownerId),
+            repos.stats.setSetting('master_webhook_last_status', inspection.status, ownerId),
+            repos.stats.setSetting('master_webhook_last_error', mismatchErr, ownerId),
+            repos.stats.setSetting('master_webhook_last_response', JSON.stringify(inspection.telegramResponse), ownerId),
+          ]);
+
+          basePayload.configuration.masterBotUsername = me.result.username || basePayload.configuration.masterBotUsername;
+          basePayload.webhook = {
+            ...basePayload.webhook,
+            status: inspection.status,
+            verified: inspection.verified,
+            lastVerifiedAt: now,
+            lastError: mismatchErr || null,
+            telegramResponse: inspection.telegramResponse,
+            inspection,
+          };
+        }
+
+        return jsonResponse(basePayload, 200, env);
+      }
+
+      // Master Bot Webhook — Manual One-Time Registration Only (Owner triggered)
       if (method === 'POST' && path === '/api/master/register-webhook') {
         if (!env.MASTER_BOT_TOKEN || !env.MASTER_WEBHOOK_SECRET) {
           return jsonResponse(
-            { ok: false, error: 'MASTER_BOT_TOKEN and MASTER_WEBHOOK_SECRET must be set via wrangler secret put.' },
+            {
+              ok: false,
+              status: 'configuration_missing',
+              error: 'MASTER_BOT_TOKEN and MASTER_WEBHOOK_SECRET must be set via Cloudflare Worker secrets.',
+            },
             400,
             env
           );
         }
-        const webhookUrl = buildMasterWebhookUrl(env.WORKER_PUBLIC_URL);
-        const me = await telegram.getMe(env.MASTER_BOT_TOKEN);
-        const verification = await registerAndVerifyWebhook({
-          telegram,
-          token: env.MASTER_BOT_TOKEN,
-          webhookUrl,
-          secretToken: env.MASTER_WEBHOOK_SECRET,
-        });
-        return jsonResponse({ ok: true, bot: me.result, verification }, 200, env);
+
+        const webhookUrl = buildMasterWebhookUrl(workerPublicUrl);
+        try {
+          const me = await telegram.getMe(env.MASTER_BOT_TOKEN);
+          const verification = await registerAndVerifyWebhook({
+            telegram,
+            token: env.MASTER_BOT_TOKEN,
+            webhookUrl,
+            secretToken: env.MASTER_WEBHOOK_SECRET,
+            allowedUpdates: MASTER_BOT_ALLOWED_UPDATES,
+          });
+
+          const registeredAt = verification.verifiedAt;
+          await Promise.all([
+            repos.stats.setSetting('master_bot_username', me.result.username || '', ownerId),
+            repos.stats.setSetting('master_webhook_last_registered_at', registeredAt, ownerId),
+            repos.stats.setSetting('master_webhook_last_verified_at', registeredAt, ownerId),
+            repos.stats.setSetting('master_webhook_last_status', 'verified', ownerId),
+            repos.stats.setSetting('master_webhook_last_error', verification.lastErrorMessage || '', ownerId),
+            repos.stats.setSetting('master_webhook_last_response', JSON.stringify(verification.telegramResponse), ownerId),
+          ]);
+
+          await writeSystemLog(env, {
+            level: 'audit',
+            source: 'master-webhook',
+            message: `Manually registered and verified Master Bot @${me.result.username} webhook`,
+            metadata: { webhookUrl, allowedUpdates: MASTER_BOT_ALLOWED_UPDATES },
+            actorTelegramId: ownerId,
+          });
+
+          return jsonResponse(
+            {
+              ok: true,
+              status: 'verified',
+              verified: true,
+              workerPublicUrl,
+              expectedWebhookUrl: webhookUrl,
+              lastRegisteredAt: registeredAt,
+              lastVerifiedAt: registeredAt,
+              bot: {
+                id: me.result.id,
+                username: me.result.username,
+                first_name: me.result.first_name,
+              },
+              verification,
+            },
+            200,
+            env
+          );
+        } catch (regErr) {
+          const safeError = redactString(regErr?.message || 'Master Bot webhook registration failed');
+          await Promise.all([
+            repos.stats.setSetting('master_webhook_last_status', 'failed', ownerId),
+            repos.stats.setSetting('master_webhook_last_error', safeError, ownerId),
+          ]).catch(() => {});
+
+          await writeSystemLog(env, {
+            level: 'error',
+            source: 'master-webhook',
+            message: `Master Bot webhook registration failed: ${safeError}`,
+            metadata: { expectedWebhookUrl: webhookUrl, method: regErr?.method || null },
+            actorTelegramId: ownerId,
+          });
+
+          const httpStatus =
+            regErr?.status === 504 ? 504 : regErr?.status >= 400 && regErr?.status < 600 ? regErr.status : 502;
+          return jsonResponse(
+            {
+              ok: false,
+              status: 'failed',
+              verified: false,
+              workerPublicUrl,
+              expectedWebhookUrl: webhookUrl,
+              error: safeError,
+              errorCode: regErr?.errorCode || null,
+              telegramMethod: regErr?.method || null,
+            },
+            httpStatus,
+            env
+          );
+        }
+      }
+
+      // Master Bot Webhook — Manual Verification via Telegram getWebhookInfo
+      if (method === 'POST' && path === '/api/master/verify-webhook') {
+        if (!env.MASTER_BOT_TOKEN) {
+          return jsonResponse(
+            {
+              ok: false,
+              status: 'configuration_missing',
+              error: 'MASTER_BOT_TOKEN must be configured via Cloudflare Worker secrets before verifying.',
+            },
+            400,
+            env
+          );
+        }
+
+        const webhookUrl = buildMasterWebhookUrl(workerPublicUrl);
+        try {
+          const settings = await repos.stats.getSettings();
+          const me = await telegram.getMe(env.MASTER_BOT_TOKEN);
+          const inspection = await inspectWebhookStatus({
+            telegram,
+            token: env.MASTER_BOT_TOKEN,
+            expectedUrl: webhookUrl,
+          });
+
+          const verifiedAt = inspection.checkedAt;
+          const readableError =
+            inspection.status === 'mismatch'
+              ? `Webhook URL mismatch: Telegram reports "${inspection.actualUrl}" instead of "${webhookUrl}".`
+              : inspection.status === 'not_registered'
+                ? 'Master Bot webhook is not currently registered with Telegram.'
+                : inspection.lastErrorMessage || '';
+
+          await Promise.all([
+            repos.stats.setSetting('master_bot_username', me.result.username || '', ownerId),
+            repos.stats.setSetting('master_webhook_last_verified_at', verifiedAt, ownerId),
+            repos.stats.setSetting('master_webhook_last_status', inspection.status, ownerId),
+            repos.stats.setSetting('master_webhook_last_error', readableError, ownerId),
+            repos.stats.setSetting('master_webhook_last_response', JSON.stringify(inspection.telegramResponse), ownerId),
+          ]);
+
+          await writeSystemLog(env, {
+            level: 'audit',
+            source: 'master-webhook',
+            message: `Verified Master Bot @${me.result.username} webhook status: ${inspection.status}`,
+            metadata: { expectedWebhookUrl: webhookUrl, actualUrl: inspection.actualUrl, verified: inspection.verified },
+            actorTelegramId: ownerId,
+          });
+
+          return jsonResponse(
+            {
+              ok: true,
+              verified: inspection.verified,
+              status: inspection.status,
+              workerPublicUrl,
+              expectedWebhookUrl: webhookUrl,
+              lastRegisteredAt: settings.map?.master_webhook_last_registered_at || null,
+              lastVerifiedAt: verifiedAt,
+              error: readableError || null,
+              bot: {
+                id: me.result.id,
+                username: me.result.username,
+                first_name: me.result.first_name,
+              },
+              verification: inspection,
+            },
+            200,
+            env
+          );
+        } catch (verErr) {
+          const safeError = redactString(verErr?.message || 'Master Bot webhook verification failed');
+          await writeSystemLog(env, {
+            level: 'error',
+            source: 'master-webhook',
+            message: `Master Bot webhook verification failed: ${safeError}`,
+            metadata: { expectedWebhookUrl: webhookUrl },
+            actorTelegramId: ownerId,
+          });
+          const httpStatus =
+            verErr?.status === 504 ? 504 : verErr?.status >= 400 && verErr?.status < 600 ? verErr.status : 502;
+          return jsonResponse(
+            {
+              ok: false,
+              verified: false,
+              status: 'failed',
+              workerPublicUrl,
+              expectedWebhookUrl: webhookUrl,
+              error: safeError,
+              errorCode: verErr?.errorCode || null,
+              telegramMethod: verErr?.method || null,
+            },
+            httpStatus,
+            env
+          );
+        }
       }
 
       // Overview & Analytics
@@ -270,6 +557,8 @@ export async function routeRequest(request, env, ctx, { fetchImpl = globalThis.f
           telegram,
           repos,
           rawToken: body?.token,
+          ownerTelegramId: body?.ownerTelegramId || ownerId,
+          allowRetryFailed: true,
         });
         // Never echo rawToken back!
         return jsonResponse(
@@ -279,6 +568,7 @@ export async function routeRequest(request, env, ctx, { fetchImpl = globalThis.f
               telegramBotId: validated.telegramBotId,
               telegramUsername: validated.telegramUsername,
               telegramFirstName: validated.telegramFirstName,
+              retryBotId: validated.retryBotId || null,
             },
           },
           200,
@@ -290,8 +580,9 @@ export async function routeRequest(request, env, ctx, { fetchImpl = globalThis.f
       if (method === 'POST' && path === '/api/bots/deploy') {
         const body = await request.json();
         const stagesLog = [];
+        const deployEnv = { ...env, WORKER_PUBLIC_URL: workerPublicUrl };
         const result = await deployTenantBot({
-          env,
+          env: deployEnv,
           repos,
           telegram,
           ownerTelegramId: body.ownerTelegramId || ownerId,
@@ -306,12 +597,15 @@ export async function routeRequest(request, env, ctx, { fetchImpl = globalThis.f
             stagesLog.push({ stage, detail, at: new Date().toISOString() });
           },
         });
-        const safeBot = { ...result.bot };
-        delete safeBot.token_encrypted;
-        delete safeBot.token_hash;
-        delete safeBot.webhook_secret;
         return jsonResponse(
-          { ok: true, bot: safeBot, template: result.template, verification: result.verification, stages: stagesLog },
+          {
+            ok: true,
+            bot: sanitizeBotForApi(result.bot),
+            template: result.template,
+            verification: result.verification,
+            retried: result.retried,
+            stages: stagesLog,
+          },
           201,
           env
         );
@@ -332,7 +626,7 @@ export async function routeRequest(request, env, ctx, { fetchImpl = globalThis.f
       if (botDetailMatch) {
         const botId = botDetailMatch[1];
         if (method === 'GET') {
-          const detail = await inspectBotDetail({ env, repos, telegram, botId });
+          const detail = await inspectBotDetail({ env: { ...env, WORKER_PUBLIC_URL: workerPublicUrl }, repos, telegram, botId });
           if (!detail) return jsonResponse({ ok: false, error: 'Bot not found' }, 404, env);
           return jsonResponse({ ok: true, ...detail }, 200, env);
         }
@@ -347,10 +641,16 @@ export async function routeRequest(request, env, ctx, { fetchImpl = globalThis.f
         const [, botId, action] = botActionMatch;
         if (action === 'disable') {
           const bot = await ownerDisableBot({ env, repos, telegram, botId, actorTelegramId: ownerId });
-          return jsonResponse({ ok: true, bot }, 200, env);
+          return jsonResponse({ ok: true, bot: sanitizeBotForApi(bot) }, 200, env);
         }
-        const res = await ownerEnableAndRetryWebhook({ env, repos, telegram, botId, actorTelegramId: ownerId });
-        return jsonResponse({ ok: true, ...res }, 200, env);
+        const res = await ownerEnableAndRetryWebhook({
+          env: { ...env, WORKER_PUBLIC_URL: workerPublicUrl },
+          repos,
+          telegram,
+          botId,
+          actorTelegramId: ownerId,
+        });
+        return jsonResponse({ ok: true, bot: sanitizeBotForApi(res.bot), verification: res.verification }, 200, env);
       }
 
       // Custom Builder Menus & Branding Persistence
@@ -505,12 +805,15 @@ export async function routeRequest(request, env, ctx, { fetchImpl = globalThis.f
 
       return jsonResponse({ ok: false, error: `Endpoint not found: ${method} ${path}` }, 404, env);
     } catch (err) {
+      const safeError = redactString(err?.message || 'Internal Worker Error');
       await writeSystemLog(env, {
         level: 'error',
         source: 'api-router',
-        message: `${method} ${path} failed: ${err?.message || 'Unknown error'}`,
+        message: `${method} ${path} failed: ${safeError}`,
       });
-      return jsonResponse({ ok: false, error: err?.message || 'Internal Worker Error' }, 400, env);
+      const status =
+        err?.status === 504 ? 504 : err?.status >= 400 && err?.status < 600 ? err.status : 400;
+      return jsonResponse({ ok: false, error: safeError }, status, env);
     }
   }
 

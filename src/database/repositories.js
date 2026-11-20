@@ -199,6 +199,57 @@ export function createRepositories(db, env) {
       return this.getById(id);
     },
 
+    async prepareRetryDeployment(
+      botId,
+      {
+        telegramUsername,
+        displayName,
+        description,
+        tokenEncrypted,
+        tokenHash,
+        webhookSecret,
+        webhookUrl,
+        templateId,
+        mode = 'template',
+        plan = 'free',
+      }
+    ) {
+      const now = new Date().toISOString();
+      await db.run(
+        `UPDATE bots
+         SET telegram_username = ?,
+             display_name = ?,
+             description = ?,
+             token_encrypted = ?,
+             token_hash = ?,
+             webhook_secret = ?,
+             webhook_url = ?,
+             webhook_status = 'pending',
+             webhook_last_error = NULL,
+             template_id = ?,
+             mode = ?,
+             status = 'deploying',
+             plan = ?,
+             updated_at = ?
+         WHERE id = ?`,
+        [
+          telegramUsername,
+          displayName,
+          description || '',
+          tokenEncrypted,
+          tokenHash,
+          webhookSecret,
+          webhookUrl,
+          templateId,
+          mode,
+          plan,
+          now,
+          botId,
+        ]
+      );
+      return this.getById(botId);
+    },
+
     async getById(botId) {
       const { row } = await db.first(
         `SELECT b.*, t.slug AS template_slug, t.name AS template_name

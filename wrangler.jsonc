@@ -11,7 +11,7 @@
   // Public non-secret variables — override per environment or in Cloudflare Dashboard
   "vars": {
     "ENVIRONMENT": "production",
-    "WORKER_PUBLIC_URL": "https://bot-factory.YOUR-SUBDOMAIN.workers.dev",
+    "WORKER_PUBLIC_URL": "https://botfactory.rimpirimpi141.workers.dev",
     "MASTER_BOT_USERNAME": "REPLACE_WITH_MASTER_BOT_USERNAME",
     "ADMIN_TELEGRAM_ID": "REPLACE_WITH_OWNER_TELEGRAM_ID",
     "CORS_ALLOWED_ORIGINS": "*"

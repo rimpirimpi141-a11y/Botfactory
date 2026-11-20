@@ -24,6 +24,7 @@ import {
   type BroadcastRecord,
   type CloudflareMetricsPayload,
   type HealthResponse,
+  type MasterWebhookStatusResponse,
   type PlatformOverview,
   type SystemLogRecord,
   type UserRecord,
@@ -62,6 +63,7 @@ export default function App() {
   // Real Worker API State (zero mock operational data)
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [overview, setOverview] = useState<PlatformOverview | null>(null);
+  const [masterWebhookStatus, setMasterWebhookStatus] = useState<MasterWebhookStatusResponse | null>(null);
   const [topBots, setTopBots] = useState<BotRecord[]>([]);
   const [bots, setBots] = useState<BotRecord[]>([]);
   const [broadcasts, setBroadcasts] = useState<BroadcastRecord[]>([]);
@@ -81,6 +83,7 @@ export default function App() {
       if (!api.isConfigured) {
         setHealth(null);
         setOverview(null);
+        setMasterWebhookStatus(null);
         return;
       }
 
@@ -92,13 +95,14 @@ export default function App() {
         setMasterDeepLink(h.masterBotDeepLink);
 
         if (api.hasAuth) {
-          const [ovRes, botsRes, brcRes, cfRes, usrRes, logRes] = await Promise.allSettled([
+          const [ovRes, botsRes, brcRes, cfRes, usrRes, logRes, masterWhRes] = await Promise.allSettled([
             api.getOverview(),
             api.listBots(),
             api.listBroadcasts(),
             api.getCloudflareMetrics(),
             api.listUsers(),
             api.listLogs(),
+            api.getMasterWebhookStatus(false),
           ]);
 
           if (ovRes.status === 'fulfilled') {
@@ -115,9 +119,11 @@ export default function App() {
           if (cfRes.status === 'fulfilled') setCfMetrics(cfRes.value.metrics);
           if (usrRes.status === 'fulfilled') setUsers(usrRes.value.users || []);
           if (logRes.status === 'fulfilled') setLogs(logRes.value.logs || []);
+          if (masterWhRes.status === 'fulfilled') setMasterWebhookStatus(masterWhRes.value);
         }
       } catch (err) {
         setHealth(null);
+        setMasterWebhookStatus(null);
         setApiError(err instanceof Error ? err.message : 'Failed to connect to Cloudflare Worker');
       } finally {
         setLoading(false);
@@ -265,14 +271,17 @@ export default function App() {
         <main className="mx-auto w-full max-w-[1360px] flex-1 p-6">
           {section === 'overview' && (
             <OverviewPanel
+              connection={connection}
               connected={connected}
               loading={loading}
               error={apiError}
               health={health}
               overview={overview}
+              masterWebhookStatus={masterWebhookStatus}
               topBots={topBots}
               masterBotDeepLink={masterDeepLink}
               onRefresh={() => syncWithWorker()}
+              onMasterWebhookStatusChange={setMasterWebhookStatus}
               onOpenConnect={() => setSetupOpen(true)}
               onOpenDeploy={() => {
                 setSection('bots');

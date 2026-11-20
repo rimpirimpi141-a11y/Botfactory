@@ -13,6 +13,8 @@ export interface HealthResponse {
   tagline: string;
   status: 'operational' | 'setup_required';
   timestamp: string;
+  workerPublicUrl?: string;
+  expectedMasterWebhookUrl?: string;
   masterBotDeepLink: string | null;
   bindings: {
     d1: {
@@ -26,10 +28,82 @@ export interface HealthResponse {
     kv: boolean;
     analyticsEngine: boolean;
     masterBotConfigured: boolean;
+    masterWebhookSecretConfigured?: boolean;
     encryptionKeyConfigured: boolean;
     ownerIdConfigured: boolean;
     adminApiKeyConfigured: boolean;
     cloudflareMetricsConfigured: boolean;
+  };
+}
+
+export interface MasterWebhookTelegramInfo {
+  url: string;
+  has_custom_certificate: boolean;
+  pending_update_count: number;
+  ip_address: string | null;
+  last_error_date: number | null;
+  last_error_message: string | null;
+  last_synchronization_error_date: number | null;
+  max_connections: number;
+  allowed_updates: string[];
+}
+
+export interface MasterWebhookTelegramResponse {
+  ok?: boolean;
+  setWebhookOk?: boolean;
+  setWebhookDescription?: string;
+  webhookInfo?: MasterWebhookTelegramInfo;
+}
+
+export interface MasterWebhookStatusResponse {
+  ok: boolean;
+  configuration: {
+    masterBotTokenConfigured: boolean;
+    masterWebhookSecretConfigured: boolean;
+    readyForRegistration: boolean;
+    masterBotUsername: string | null;
+    workerPublicUrl: string;
+    expectedWebhookUrl: string;
+    allowedUpdates: string[];
+  };
+  webhook: {
+    status: 'verified' | 'mismatch' | 'not_registered' | 'failed' | string;
+    verified: boolean;
+    lastRegisteredAt: string | null;
+    lastVerifiedAt: string | null;
+    lastError: string | null;
+    telegramResponse: MasterWebhookTelegramResponse | null;
+  };
+}
+
+export interface MasterWebhookActionResponse {
+  ok: boolean;
+  verified: boolean;
+  status: 'verified' | 'mismatch' | 'not_registered' | 'failed' | 'configuration_missing' | string;
+  workerPublicUrl: string;
+  expectedWebhookUrl: string;
+  lastRegisteredAt: string | null;
+  lastVerifiedAt: string | null;
+  error?: string | null;
+  bot?: {
+    id: number;
+    username: string;
+    first_name: string;
+  };
+  verification?: {
+    verified: boolean;
+    status: string;
+    webhookUrl?: string;
+    actualUrl?: string;
+    expectedUrl: string;
+    allowedUpdates: string[];
+    pendingUpdateCount: number;
+    lastErrorMessage: string | null;
+    lastErrorDate: number | null;
+    maxConnections: number;
+    verifiedAt?: string;
+    checkedAt?: string;
+    telegramResponse?: MasterWebhookTelegramResponse;
   };
 }
 
@@ -271,11 +345,12 @@ export function createWorkerApi(conn: WorkerConnection) {
     isConfigured: Boolean(baseUrl),
     hasAuth: Boolean(baseUrl && conn.adminApiKey.trim()),
     health: () => request<HealthResponse>('/api/health', { method: 'GET' }, false),
+    getMasterWebhookStatus: (live = false) =>
+      request<MasterWebhookStatusResponse>(`/api/master/webhook-status${live ? '?live=true' : ''}`, { method: 'GET' }),
     registerMasterWebhook: () =>
-      request<{ ok: boolean; bot: { username: string; id: number }; verification: { webhookUrl: string } }>(
-        '/api/master/register-webhook',
-        { method: 'POST' }
-      ),
+      request<MasterWebhookActionResponse>('/api/master/register-webhook', { method: 'POST' }),
+    verifyMasterWebhook: () =>
+      request<MasterWebhookActionResponse>('/api/master/verify-webhook', { method: 'POST' }),
     getOverview: () =>
       request<{
         ok: boolean;

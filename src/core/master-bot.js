@@ -460,7 +460,13 @@ async function handleWizardTextStep({ env, repos, telegram, token, chatId, teleg
   // Step 4 -> Step 5: Real Telegram getMe token validation
   if (wizard.step === 'await_token') {
     try {
-      const validated = await validateTokenForDeployment({ telegram, repos, rawToken: text });
+      const validated = await validateTokenForDeployment({
+        telegram,
+        repos,
+        rawToken: text,
+        ownerTelegramId: telegramId,
+        allowRetryFailed: true,
+      });
       // Best effort: remove user's token message from chat history if permissions allow
       await repos.users.setWizardState(telegramId, {
         ...wizard,

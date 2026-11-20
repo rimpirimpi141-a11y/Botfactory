@@ -10,30 +10,43 @@ import {
   Users,
   AlertTriangle,
 } from 'lucide-react';
-import type { BotRecord, HealthResponse, PlatformOverview } from '../api';
+import type {
+  BotRecord,
+  HealthResponse,
+  MasterWebhookStatusResponse,
+  PlatformOverview,
+  WorkerConnection,
+} from '../api';
+import { MasterWebhookCard } from './MasterWebhookCard';
 
 interface OverviewPanelProps {
+  connection: WorkerConnection;
   connected: boolean;
   loading: boolean;
   error: string | null;
   health: HealthResponse | null;
   overview: PlatformOverview | null;
+  masterWebhookStatus: MasterWebhookStatusResponse | null;
   topBots: BotRecord[];
   masterBotDeepLink: string | null;
   onRefresh: () => void;
+  onMasterWebhookStatusChange: (next: MasterWebhookStatusResponse) => void;
   onOpenConnect: () => void;
   onOpenDeploy: () => void;
 }
 
 export function OverviewPanel({
+  connection,
   connected,
   loading,
   error,
   health,
   overview,
+  masterWebhookStatus,
   topBots,
   masterBotDeepLink,
   onRefresh,
+  onMasterWebhookStatusChange,
   onOpenConnect,
   onOpenDeploy,
 }: OverviewPanelProps) {
@@ -124,6 +137,16 @@ export function OverviewPanel({
           );
         })}
       </div>
+
+      {/* Master Bot Manual Webhook Registration Section */}
+      <MasterWebhookCard
+        connection={connection}
+        connected={connected}
+        health={health}
+        statusData={masterWebhookStatus}
+        onStatusUpdated={onMasterWebhookStatusChange}
+        onOpenConnect={onOpenConnect}
+      />
 
       {/* Main Split: Daily Webhook Traffic + Infrastructure Readiness */}
       <div className="grid gap-6 lg:grid-cols-3">
