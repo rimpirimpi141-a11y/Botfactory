@@ -9,7 +9,7 @@
 
 import { timingSafeEqual } from './token-security.js';
 
-export const MASTER_BOT_ALLOWED_UPDATES = ['message', 'callback_query'];
+export const MASTER_BOT_ALLOWED_UPDATES = ['message', 'callback_query', 'chat_member', 'my_chat_member'];
 export const DEFAULT_TENANT_ALLOWED_UPDATES = ['message', 'callback_query', 'chat_member', 'my_chat_member'];
 
 export function buildTenantWebhookUrl(workerPublicUrl, botId) {

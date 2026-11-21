@@ -1,4 +1,5 @@
 import React from 'react';
+import { motion } from 'motion/react';
 import {
   Activity,
   Bot,
@@ -124,12 +125,15 @@ export function OverviewPanel({
 
       {/* KPI Strip */}
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-        {kpis.map((item) => {
+        {kpis.map((item, idx) => {
           const Icon = item.icon;
           return (
-            <div
+            <motion.div
               key={item.label}
-              className="rounded-xl border border-slate-800/80 bg-[#0D1322] p-5 transition-colors hover:border-slate-700"
+              initial={{ opacity: 0, y: 10 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ duration: 0.22, delay: idx * 0.045, ease: 'easeOut' }}
+              className="bf-card-interactive rounded-xl border border-slate-800/80 bg-[#0D1322] p-5 hover:border-blue-500/40"
             >
               <div className="flex items-center justify-between text-xs text-slate-400">
                 <span>{item.label}</span>
@@ -141,7 +145,7 @@ export function OverviewPanel({
               <div className="mt-1.5 text-xs text-slate-500">
                 {loading ? <div className="bf-skeleton h-3.5 w-36 rounded" /> : item.sub}
               </div>
-            </div>
+            </motion.div>
           );
         })}
       </div>

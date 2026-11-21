@@ -14,6 +14,17 @@ import { formatBrandedMessage } from '../../builder/theme-engine.js';
 import { buildReplyKeyboard, BUTTON_STYLES, chunkButtonsToRows } from '../../utils/keyboards.js';
 import { escapeHtml, validateSupportUsername } from '../../utils/validation.js';
 import { invalidateTenantCache } from '../../core/tenant-manager.js';
+import {
+  checkUserForceJoin,
+  formatDestinationLabel,
+  formatForceJoinSummaryHtml,
+  normalizeForceJoinList,
+  removeForceJoinDestination,
+  resolveAndVerifyForceJoinDestination,
+  reverifyForceJoinDestinations,
+  upsertForceJoinDestination,
+} from '../../core/force-join.js';
+import { runAnimatedOperation } from '../../utils/animations.js';
 import { newId } from '../../database/repositories.js';
 
 export const ADMIN_COMMON_LABELS = Object.freeze({
@@ -354,50 +365,218 @@ export async function handleCommonTenantAdmin(ctx, {
     if (state.step === 'force_join_input') {
       await repos.endUsers.setState(bot.id, endUser.telegram_id, null);
       const lower = text.toLowerCase();
-      let channels = Array.isArray(config.forceJoinChannels) ? [...config.forceJoinChannels] : [];
+      const existing = normalizeForceJoinList(config.forceJoinChannels || []);
+
       if (lower === 'clear') {
-        channels = [];
-      } else if (lower.startsWith('remove ')) {
-        const ch = text.slice(7).trim();
-        channels = channels.filter((c) => c.toLowerCase() !== ch.toLowerCase());
-      } else {
-        const ch = text.startsWith('@') || /^-100\d+$/.test(text) ? text : `@${text.replace(/^@/, '')}`;
-        // Verify bot can inspect channel membership via real Telegram getChatMember if possible
-        let verifiedNote = '';
-        try {
-          const me = await telegram.getMe(token);
-          const member = await telegram.getChatMember(token, ch, me.result.id);
-          const status = member?.result?.status;
-          if (!['administrator', 'creator'].includes(status)) {
-            verifiedNote = '\n⚠️ Note: Bot is not yet an administrator in this channel. Promote the bot so membership verification succeeds.';
-          } else {
-            verifiedNote = '\n✅ Verified: Bot has administrator access in this channel.';
-          }
-        } catch (err) {
-          verifiedNote = `\n⚠️ Could not verify channel admin access yet (${escapeHtml(err.message || 'channel unreachable')}). Ensure the bot is added as channel admin.`;
-        }
-        if (!channels.includes(ch)) channels.push(ch);
-        await repos.botConfigs.upsert(bot.id, { ...config, forceJoinChannels: channels });
+        const nextTemplateSettings = { ...(config.templateSettings || {}) };
+        delete nextTemplateSettings.pendingForceJoinLink;
+        await repos.botConfigs.upsert(bot.id, {
+          ...config,
+          forceJoinChannels: [],
+          templateSettings: nextTemplateSettings,
+        });
         await invalidateTenantCache(env, bot.id);
         await telegram.sendMessage(
           token,
           chatId,
-          `✅ Force Join channels updated: <b>${escapeHtml(channels.join(', '))}</b>${verifiedNote}`,
+          '✅ All Force Join destinations and pending private links have been cleared for this bot.',
           { reply_markup: adminKb }
         );
         return true;
       }
 
-      await repos.botConfigs.upsert(bot.id, { ...config, forceJoinChannels: channels });
-      await invalidateTenantCache(env, bot.id);
-      await telegram.sendMessage(
+      if (lower.startsWith('remove ')) {
+        const target = text.slice(7).trim();
+        const { removed, destinations } = removeForceJoinDestination(existing, target);
+        if (!removed) {
+          await telegram.sendMessage(
+            token,
+            chatId,
+            `❌ Could not find a Force Join destination matching <code>${escapeHtml(target)}</code>.\nUse the destination number (e.g. <code>remove 1</code>), <code>@username</code>, or chat ID.`,
+            { reply_markup: adminKb }
+          );
+          return true;
+        }
+        await repos.botConfigs.upsert(bot.id, { ...config, forceJoinChannels: destinations });
+        await invalidateTenantCache(env, bot.id);
+        await telegram.sendMessage(
+          token,
+          chatId,
+          `✅ Removed <b>${escapeHtml(formatDestinationLabel(removed))}</b> (<code>${escapeHtml(removed.chatId)}</code>).\n\n${formatForceJoinSummaryHtml(destinations, config.templateSettings?.pendingForceJoinLink)}`,
+          { reply_markup: adminKb }
+        );
+        return true;
+      }
+
+      if (lower === 'reverify') {
+        if (existing.length === 0) {
+          await telegram.sendMessage(token, chatId, 'ℹ️ No Force Join destinations configured to re-verify.', {
+            reply_markup: adminKb,
+          });
+          return true;
+        }
+        const { messageId, result } = await runAnimatedOperation({
+          telegram,
+          token,
+          chatId,
+          title: '🔍 Re-Verifying Force Join Access',
+          minStepIntervalMs: 500,
+          steps: [
+            {
+              label: `Checking bot admin rights across ${existing.length} destination(s)...`,
+              doneLabel: 'Telegram admin permissions inspected',
+              run: () => reverifyForceJoinDestinations({ telegram, token, destinations: existing }),
+            },
+            {
+              label: 'Updating verified status in Cloudflare D1...',
+              doneLabel: 'Verification statuses saved',
+              run: async (rev) => {
+                await repos.botConfigs.upsert(bot.id, { ...config, forceJoinChannels: rev.destinations });
+                await invalidateTenantCache(env, bot.id);
+                return rev;
+              },
+            },
+          ],
+        });
+
+        const reportLines = result.summary.map(
+          (item, i) =>
+            `${i + 1}. ${item.ok ? '✅' : '❌'} <b>${escapeHtml(formatDestinationLabel(item.destination))}</b> (<code>${escapeHtml(item.destination.chatId)}</code>) — <b>${escapeHtml(item.status)}</b>${item.error ? `\n   <i>${escapeHtml(item.error)}</i>` : ''}`
+        );
+        const reportText = `<b>🔍 Force Join Re-Verification Report</b>\n\n${reportLines.join('\n')}`;
+        if (messageId) {
+          await telegram.editMessageText(token, chatId, messageId, reportText).catch(() => {});
+          await telegram.sendMessage(token, chatId, 'Use the Admin Panel below to manage destinations.', {
+            reply_markup: adminKb,
+          });
+        } else {
+          await telegram.sendMessage(token, chatId, reportText, { reply_markup: adminKb });
+        }
+        return true;
+      }
+
+      if (lower === 'test' || lower.startsWith('test ')) {
+        const testUserId = text.slice(4).trim().replace(/[^0-9]/g, '') || String(endUser.telegram_id);
+        if (existing.length === 0) {
+          await telegram.sendMessage(token, chatId, 'ℹ️ Add at least one Force Join destination before testing.', {
+            reply_markup: adminKb,
+          });
+          return true;
+        }
+        const check = await checkUserForceJoin({
+          telegram,
+          token,
+          destinations: existing,
+          userId: testUserId,
+        });
+        const lines = check.results.map(
+          (r, i) =>
+            `${i + 1}. ${r.joined ? '✅' : '❌'} <b>${escapeHtml(formatDestinationLabel(r.destination))}</b> (<code>${escapeHtml(r.destination.chatId)}</code>) — status: <b>${escapeHtml(r.status)}</b>${r.status === 'restricted' ? ` (is_member: ${Boolean(r.isMember)})` : ''}${r.error ? ` · <i>${escapeHtml(r.error)}</i>` : ''}`
+        );
+        await telegram.sendMessage(
+          token,
+          chatId,
+          `<b>🧪 Membership Test for User <code>${escapeHtml(testUserId)}</code></b>\nOverall Result: <b>${check.passed ? '✅ PASSED' : '❌ BLOCKED'}</b>\n\n${lines.join('\n')}`,
+          { reply_markup: adminKb }
+        );
+        return true;
+      }
+
+      // Add a public or private Force Join destination (strip optional "add " prefix)
+      const rawDestination = lower.startsWith('add ') ? text.slice(4).trim() : text;
+      const { messageId, result: resolved } = await runAnimatedOperation({
+        telegram,
         token,
         chatId,
-        channels.length
-          ? `✅ Active Force Join channels: <b>${escapeHtml(channels.join(', '))}</b>`
-          : '✅ All Force Join channels cleared.',
-        { reply_markup: adminKb }
-      );
+        title: '📣 Verifying Force Join Destination',
+        minStepIntervalMs: 500,
+        steps: [
+          {
+            label: 'Parsing Telegram username / URL & verifying admin permissions...',
+            doneLabel: 'Destination verified via Telegram Bot API',
+            run: () =>
+              resolveAndVerifyForceJoinDestination({
+                telegram,
+                token,
+                rawInput: rawDestination,
+                botUsername: bot.telegram_username,
+              }),
+          },
+        ],
+      });
+
+      if (resolved.pendingPrivateLink) {
+        const pendingLink = {
+          inviteUrl: resolved.inviteUrl,
+          inviteCode: resolved.inviteCode,
+          requestedBy: String(endUser.telegram_id),
+          chatId: String(chatId),
+          requestedAt: new Date().toISOString(),
+        };
+        await repos.botConfigs.upsert(bot.id, {
+          ...config,
+          templateSettings: {
+            ...(config.templateSettings || {}),
+            pendingForceJoinLink: pendingLink,
+          },
+        });
+        await invalidateTenantCache(env, bot.id);
+        if (messageId) {
+          await telegram.editMessageText(token, chatId, messageId, resolved.instructions).catch(() => {});
+          await telegram.sendMessage(token, chatId, '⏳ Waiting for Telegram admin promotion update...', {
+            reply_markup: adminKb,
+          });
+        } else {
+          await telegram.sendMessage(token, chatId, resolved.instructions, { reply_markup: adminKb });
+        }
+        return true;
+      }
+
+      if (!resolved.ok) {
+        const errCard = `❌ <b>Force Join Verification Failed</b>\n\n${escapeHtml(resolved.error)}`;
+        if (messageId) {
+          await telegram.editMessageText(token, chatId, messageId, errCard).catch(() => {});
+          await telegram.sendMessage(token, chatId, 'Destination was NOT saved. Fix the issue above and try again.', {
+            reply_markup: adminKb,
+          });
+        } else {
+          await telegram.sendMessage(token, chatId, errCard, { reply_markup: adminKb });
+        }
+        return true;
+      }
+
+      const updated = upsertForceJoinDestination(existing, resolved.destination);
+      const nextTemplateSettings = { ...(config.templateSettings || {}) };
+      if (resolved.destination.isPrivate && nextTemplateSettings.pendingForceJoinLink) {
+        delete nextTemplateSettings.pendingForceJoinLink;
+      }
+      await repos.botConfigs.upsert(bot.id, {
+        ...config,
+        forceJoinChannels: updated,
+        templateSettings: nextTemplateSettings,
+      });
+      await invalidateTenantCache(env, bot.id);
+
+      const d = resolved.destination;
+      const okCard = [
+        `✅ <b>Force Join Destination Verified & Saved!</b>`,
+        `• <b>Name:</b> ${escapeHtml(d.title)}`,
+        `• <b>Type:</b> ${d.isPrivate ? '🔐 Private' : '🌐 Public'} ${escapeHtml(d.chatType)}`,
+        `• <b>Numeric Chat ID:</b> <code>${escapeHtml(d.chatId)}</code>`,
+        `• <b>Join URL:</b> <code>${escapeHtml(d.inviteUrl || '')}</code>`,
+        `• <b>Bot Admin Status:</b> ${escapeHtml(d.botStatus.toUpperCase())}`,
+        '',
+        `Total active destinations: <b>${updated.length}</b>`,
+      ].join('\n');
+
+      if (messageId) {
+        await telegram.editMessageText(token, chatId, messageId, okCard).catch(() => {});
+        await telegram.sendMessage(token, chatId, '✅ Force Join configuration is now live.', {
+          reply_markup: adminKb,
+        });
+      } else {
+        await telegram.sendMessage(token, chatId, okCard, { reply_markup: adminKb });
+      }
       return true;
     }
 
@@ -526,12 +705,27 @@ export async function handleCommonTenantAdmin(ctx, {
     }
 
     case ADMIN_COMMON_LABELS.FORCE_JOIN: {
-      const current = (config.forceJoinChannels || []).join(', ') || 'None';
+      const summary = formatForceJoinSummaryHtml(
+        config.forceJoinChannels || [],
+        config.templateSettings?.pendingForceJoinLink || null
+      );
       await repos.endUsers.setState(bot.id, endUser.telegram_id, { scope: 'tenant_admin', step: 'force_join_input' });
       await telegram.sendMessage(
         token,
         chatId,
-        `<b>📣 Force Join Channels</b>\nCurrent: <b>${escapeHtml(current)}</b>\n\nSend <code>@ChannelUsername</code> (or <code>-100...</code>) to add, <code>remove @Channel</code> to remove, or <code>clear</code>:`,
+        [
+          '<b>📣 Force Join Management (Public & Private)</b>',
+          '',
+          summary,
+          '',
+          '<b>Supported Actions:</b>',
+          '• <b>Add Public:</b> <code>@username</code> or <code>https://t.me/username</code>',
+          '• <b>Add Private:</b> <code>https://t.me/+INVITECODE</code> or <code>https://t.me/joinchat/CODE</code>',
+          '• <b>Remove:</b> <code>remove 1</code> or <code>remove @username</code>',
+          '• <b>Re-verify Admin Access:</b> <code>reverify</code>',
+          '• <b>Test Membership:</b> <code>test</code> or <code>test USER_ID</code>',
+          '• <b>Clear All:</b> <code>clear</code>',
+        ].join('\n'),
         { reply_markup: buildCancelReplyKeyboard() }
       );
       return true;

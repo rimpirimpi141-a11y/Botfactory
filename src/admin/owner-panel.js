@@ -11,6 +11,17 @@ import { getCloudflareInfrastructureMetrics } from './cloudflare-monitor.js';
 import { processBroadcastBatch, queueBroadcast } from './broadcast.js';
 import { ownerDeleteBot, ownerDisableBot, ownerEnableAndRetryWebhook } from './bot-management.js';
 import {
+  checkUserForceJoin,
+  formatDestinationLabel,
+  formatForceJoinSummaryHtml,
+  normalizeForceJoinList,
+  removeForceJoinDestination,
+  resolveAndVerifyForceJoinDestination,
+  reverifyForceJoinDestinations,
+  upsertForceJoinDestination,
+} from '../core/force-join.js';
+import { runAnimatedOperation } from '../utils/animations.js';
+import {
   buildApprovalButtons,
   buildConfirmCancelKeyboard,
   buildInlineKeyboard,
@@ -73,7 +84,13 @@ export async function handleOwnerMessage({ env, repos, telegram, token, msg, use
   const auth = await checkOwnerAuthorization(repos, env, actorId);
   if (!auth.authorized) {
     if (isOwnerMenuButton(text)) {
-      await telegram.sendMessage(token, chatId, '🔒 Unauthorized. Owner Control Center access is restricted.');
+      await writeSystemLog(env, {
+        level: 'security',
+        source: 'owner-panel',
+        message: `Rejected unauthorized Owner Control Center access attempt from ${actorId}`,
+        actorTelegramId: actorId,
+      }).catch(() => {});
+      await telegram.sendMessage(token, chatId, '🔒 Unauthorized. Owner Control Center access is strictly restricted to platform administrators.');
       return true;
     }
     return false;
@@ -128,6 +145,7 @@ export async function handleOwnerMessage({ env, repos, telegram, token, msg, use
     }
 
     case OWNER_CONTROL_BUTTONS.ALL_BOTS: {
+      await repos.users.setWizardState(actorId, null);
       const bots = await repos.bots.listAll({ limit: 12 });
       if (!bots.length) {
         await telegram.sendMessage(token, chatId, 'No tenant bots deployed yet.', {
@@ -189,21 +207,37 @@ export async function handleOwnerMessage({ env, repos, telegram, token, msg, use
       const settings = await repos.stats.getSettings();
       const enabled = settings.map.platform_force_join_enabled === 'true';
       let channels = [];
+      let pendingLink = null;
       try {
         channels = JSON.parse(settings.map.platform_force_join_channels || '[]');
       } catch {
         channels = [];
+      }
+      try {
+        pendingLink = settings.map.platform_force_join_pending
+          ? JSON.parse(settings.map.platform_force_join_pending)
+          : null;
+      } catch {
+        pendingLink = null;
       }
       await repos.users.setWizardState(actorId, { flow: 'owner_panel', step: 'force_join_cmd' });
       await telegram.sendMessage(
         token,
         chatId,
         [
-          '<b>📣 Platform Force Join Settings</b>',
+          '<b>📣 Platform Force Join Settings (Public & Private)</b>',
           `• Status: <b>${enabled ? 'ENABLED' : 'DISABLED'}</b>`,
-          `• Channels: <b>${channels.length ? escapeHtml(channels.join(', ')) : 'None'}</b>`,
           '',
-          'Commands: <code>toggle</code> · <code>add @Channel</code> · <code>remove @Channel</code> · <code>clear</code>',
+          formatForceJoinSummaryHtml(channels, pendingLink),
+          '',
+          '<b>Commands:</b>',
+          '• <code>toggle</code> — Enable / Disable Platform Force Join',
+          '• <code>add @username</code> or <code>add https://t.me/username</code>',
+          '• <code>add https://t.me/+INVITECODE</code> (auto-links via admin promotion)',
+          '• <code>remove 1</code> or <code>remove @username</code>',
+          '• <code>reverify</code> — Recheck Master Bot admin access',
+          '• <code>test</code> or <code>test USER_ID</code> — Test membership check',
+          '• <code>clear</code> — Clear all destinations',
         ].join('\n'),
         { reply_markup: buildOwnerControlReplyKeyboard() }
       );
@@ -230,6 +264,7 @@ export async function handleOwnerMessage({ env, repos, telegram, token, msg, use
     }
 
     case OWNER_CONTROL_BUTTONS.PLANS_REFERRALS: {
+      await repos.users.setWizardState(actorId, null);
       const refs = await repos.platformReferrals.listAll({ limit: 15 });
       const pending = refs.filter((r) => r.status === 'pending');
       const lines = refs
@@ -295,11 +330,13 @@ export async function handleOwnerMessage({ env, repos, telegram, token, msg, use
     }
 
     case OWNER_CONTROL_BUTTONS.CF_MONITOR: {
+      await repos.users.setWizardState(actorId, null);
       await sendCloudflareMonitorMessage({ env, repos, telegram, token, chatId });
       return true;
     }
 
     case OWNER_CONTROL_BUTTONS.ACTIVITY_LOGS: {
+      await repos.users.setWizardState(actorId, null);
       const logs = await repos.stats.getRecentLogs({ limit: 12 });
       const lines = logs
         .map((l) => `• [${l.level.toUpperCase()}] <b>${escapeHtml(l.source)}</b>: ${escapeHtml(l.message.slice(0, 110))}`)
@@ -314,6 +351,7 @@ export async function handleOwnerMessage({ env, repos, telegram, token, msg, use
     }
 
     case OWNER_CONTROL_BUTTONS.PLATFORM_SETTINGS: {
+      await repos.users.setWizardState(actorId, null);
       const settings = await repos.stats.getSettings();
       const lines = [
         `• Promo Footer: <b>${settings.map.promo_footer_enabled}</b>`,
@@ -373,6 +411,11 @@ async function handleOwnerStatefulInput({ env, repos, telegram, token, chatId, a
     if (cmd === 'plan' && parts[1] && ['free', 'starter', 'pro', 'enterprise'].includes((parts[2] || '').toLowerCase())) {
       const tid = parts[1].replace(/[^0-9]/g, '');
       const plan = parts[2].toLowerCase();
+      const targetUser = await repos.users.getByTelegramId(tid);
+      if (!targetUser) {
+        await telegram.sendMessage(token, chatId, `❌ User <code>${escapeHtml(tid)}</code> was not found in D1.`, { reply_markup: kb });
+        return true;
+      }
       await repos.users.updatePlanAndStatus(tid, { plan });
       await writeSystemLog(env, { level: 'audit', source: 'owner-panel', message: `Changed user ${tid} plan to ${plan}`, actorTelegramId: actorId });
       await telegram.sendMessage(token, chatId, `✅ User <code>${tid}</code> plan updated to <b>${plan.toUpperCase()}</b>.`, { reply_markup: kb });
@@ -385,6 +428,11 @@ async function handleOwnerStatefulInput({ env, repos, telegram, token, chatId, a
         await telegram.sendMessage(token, chatId, '❌ Invalid slot number. Example: <code>slots 123456 5</code>', { reply_markup: kb });
         return true;
       }
+      const targetUser = await repos.users.getByTelegramId(tid);
+      if (!targetUser) {
+        await telegram.sendMessage(token, chatId, `❌ User <code>${escapeHtml(tid)}</code> was not found in D1.`, { reply_markup: kb });
+        return true;
+      }
       await repos.users.adjustBotSlots(tid, bonus);
       await writeSystemLog(env, { level: 'audit', source: 'owner-panel', message: `Adjusted user ${tid} bonus_bot_slots to ${bonus}`, actorTelegramId: actorId });
       await telegram.sendMessage(token, chatId, `✅ User <code>${tid}</code> bonus bot slots set to <b>${bonus}</b> (audit logged).`, { reply_markup: kb });
@@ -394,6 +442,11 @@ async function handleOwnerStatefulInput({ env, repos, telegram, token, chatId, a
       const tid = parts[1].replace(/[^0-9]/g, '');
       if (isOwnerTelegramId(tid, env)) {
         await telegram.sendMessage(token, chatId, '🚫 Super Admin cannot be banned.', { reply_markup: kb });
+        return true;
+      }
+      const targetUser = await repos.users.getByTelegramId(tid);
+      if (!targetUser) {
+        await telegram.sendMessage(token, chatId, `❌ User <code>${escapeHtml(tid)}</code> was not found in D1.`, { reply_markup: kb });
         return true;
       }
       await repos.users.updatePlanAndStatus(tid, { status: cmd === 'ban' ? 'suspended' : 'active' });
@@ -426,48 +479,166 @@ async function handleOwnerStatefulInput({ env, repos, telegram, token, chatId, a
     const settings = await repos.stats.getSettings();
     let channels = [];
     try {
-      channels = JSON.parse(settings.map.platform_force_join_channels || '[]');
+      channels = normalizeForceJoinList(JSON.parse(settings.map.platform_force_join_channels || '[]'));
     } catch {
       channels = [];
     }
     const lower = text.toLowerCase();
+
     if (lower === 'toggle') {
       const next = settings.map.platform_force_join_enabled === 'true' ? 'false' : 'true';
       await repos.stats.setSetting('platform_force_join_enabled', next, actorId);
+      await writeSystemLog(env, { level: 'audit', source: 'owner-panel', message: `Platform Force Join toggled to ${next}`, actorTelegramId: actorId });
       await telegram.sendMessage(token, chatId, `✅ Platform Force Join is now <b>${next === 'true' ? 'ENABLED' : 'DISABLED'}</b>.`, { reply_markup: kb });
       return true;
     }
+
     if (lower === 'clear') {
       await repos.stats.setSetting('platform_force_join_channels', '[]', actorId);
-      await telegram.sendMessage(token, chatId, '✅ Platform Force Join channels cleared.', { reply_markup: kb });
+      await repos.stats.setSetting('platform_force_join_pending', '', actorId);
+      await writeSystemLog(env, { level: 'audit', source: 'owner-panel', message: 'Cleared platform Force Join destinations', actorTelegramId: actorId });
+      await telegram.sendMessage(token, chatId, '✅ Platform Force Join destinations and pending links cleared.', { reply_markup: kb });
       return true;
     }
+
     if (lower.startsWith('remove ')) {
-      const ch = text.slice(7).trim();
-      channels = channels.filter((c) => c.toLowerCase() !== ch.toLowerCase());
-      await repos.stats.setSetting('platform_force_join_channels', JSON.stringify(channels), actorId);
-      await telegram.sendMessage(token, chatId, `✅ Removed ${escapeHtml(ch)}. Remaining: ${escapeHtml(channels.join(', ') || 'None')}`, { reply_markup: kb });
+      const query = text.slice(7).trim();
+      const { removed, destinations } = removeForceJoinDestination(channels, query);
+      if (!removed) {
+        await telegram.sendMessage(token, chatId, `❌ No platform Force Join destination matched <code>${escapeHtml(query)}</code>.`, { reply_markup: kb });
+        return true;
+      }
+      await repos.stats.setSetting('platform_force_join_channels', JSON.stringify(destinations), actorId);
+      await writeSystemLog(env, { level: 'audit', source: 'owner-panel', message: `Removed platform Force Join destination ${removed.chatId}`, actorTelegramId: actorId });
+      await telegram.sendMessage(
+        token,
+        chatId,
+        `✅ Removed <b>${escapeHtml(formatDestinationLabel(removed))}</b>.\n\n${formatForceJoinSummaryHtml(destinations)}`,
+        { reply_markup: kb }
+      );
       return true;
     }
+
+    if (lower === 'reverify') {
+      if (!channels.length) {
+        await telegram.sendMessage(token, chatId, 'ℹ️ No Platform Force Join destinations configured to re-verify.', { reply_markup: kb });
+        return true;
+      }
+      const rev = await reverifyForceJoinDestinations({ telegram, token, destinations: channels });
+      await repos.stats.setSetting('platform_force_join_channels', JSON.stringify(rev.destinations), actorId);
+      const lines = rev.summary.map(
+        (item, idx) =>
+          `${idx + 1}. ${item.ok ? '✅' : '❌'} <b>${escapeHtml(formatDestinationLabel(item.destination))}</b> (<code>${escapeHtml(item.destination.chatId)}</code>) — <b>${escapeHtml(item.status)}</b>${item.error ? `\n   <i>${escapeHtml(item.error)}</i>` : ''}`
+      );
+      await telegram.sendMessage(token, chatId, `<b>🔍 Platform Force Join Re-Verification</b>\n\n${lines.join('\n')}`, { reply_markup: kb });
+      return true;
+    }
+
+    if (lower === 'test' || lower.startsWith('test ')) {
+      const targetUserId = text.slice(4).trim().replace(/[^0-9]/g, '') || actorId;
+      if (!channels.length) {
+        await telegram.sendMessage(token, chatId, 'ℹ️ Configure at least one Force Join destination first.', { reply_markup: kb });
+        return true;
+      }
+      const check = await checkUserForceJoin({ telegram, token, destinations: channels, userId: targetUserId });
+      const lines = check.results.map(
+        (r, i) =>
+          `${i + 1}. ${r.joined ? '✅' : '❌'} <b>${escapeHtml(formatDestinationLabel(r.destination))}</b> (<code>${escapeHtml(r.destination.chatId)}</code>) — <b>${escapeHtml(r.status)}</b>${r.status === 'restricted' ? ` (is_member: ${Boolean(r.isMember)})` : ''}`
+      );
+      await telegram.sendMessage(
+        token,
+        chatId,
+        `<b>🧪 Platform Force Join Test for <code>${escapeHtml(targetUserId)}</code></b>\nResult: <b>${check.passed ? '✅ PASSED' : '❌ BLOCKED'}</b>\n\n${lines.join('\n')}`,
+        { reply_markup: kb }
+      );
+      return true;
+    }
+
     if (lower.startsWith('add ')) {
       const raw = text.slice(4).trim();
-      const ch = raw.startsWith('@') || /^-100\d+$/.test(raw) ? raw : `@${raw.replace(/^@/, '')}`;
-      let checkMsg = '';
-      try {
-        const me = await telegram.getMe(token);
-        const member = await telegram.getChatMember(token, ch, me.result.id);
-        checkMsg = ['administrator', 'creator'].includes(member?.result?.status)
-          ? '\n✅ Master Bot admin access verified via Telegram getChatMember.'
-          : `\n⚠️ Master Bot status in ${escapeHtml(ch)} is "${escapeHtml(member?.result?.status || 'unknown')}". Promote it to Admin!`;
-      } catch (err) {
-        checkMsg = `\n⚠️ Verification warning: ${escapeHtml(err.message || 'channel unreachable')}`;
+      const { messageId, result: resolved } = await runAnimatedOperation({
+        telegram,
+        token,
+        chatId,
+        title: '📣 Verifying Platform Force Join',
+        minStepIntervalMs: 500,
+        steps: [
+          {
+            label: 'Resolving chat metadata & verifying Master Bot admin access...',
+            doneLabel: 'Telegram verification completed',
+            run: () =>
+              resolveAndVerifyForceJoinDestination({
+                telegram,
+                token,
+                rawInput: raw,
+                botUsername: env.MASTER_BOT_USERNAME || settings.map.master_bot_username || '',
+              }),
+          },
+        ],
+      });
+
+      if (resolved.pendingPrivateLink) {
+        const pendingLink = {
+          inviteUrl: resolved.inviteUrl,
+          inviteCode: resolved.inviteCode,
+          requestedBy: actorId,
+          chatId: String(chatId),
+          requestedAt: new Date().toISOString(),
+        };
+        await repos.stats.setSetting('platform_force_join_pending', JSON.stringify(pendingLink), actorId);
+        if (messageId) {
+          await telegram.editMessageText(token, chatId, messageId, resolved.instructions).catch(() => {});
+        } else {
+          await telegram.sendMessage(token, chatId, resolved.instructions, { reply_markup: kb });
+        }
+        return true;
       }
-      if (!channels.includes(ch)) channels.push(ch);
-      await repos.stats.setSetting('platform_force_join_channels', JSON.stringify(channels), actorId);
-      await telegram.sendMessage(token, chatId, `✅ Added <b>${escapeHtml(ch)}</b> to platform Force Join.${checkMsg}`, { reply_markup: kb });
+
+      if (!resolved.ok) {
+        const errText = `❌ <b>Platform Force Join Verification Failed</b>\n\n${escapeHtml(resolved.error)}`;
+        if (messageId) {
+          await telegram.editMessageText(token, chatId, messageId, errText).catch(() => {});
+        } else {
+          await telegram.sendMessage(token, chatId, errText, { reply_markup: kb });
+        }
+        return true;
+      }
+
+      const updated = upsertForceJoinDestination(channels, resolved.destination);
+      await repos.stats.setSetting('platform_force_join_channels', JSON.stringify(updated), actorId);
+      if (resolved.destination.isPrivate) {
+        await repos.stats.setSetting('platform_force_join_pending', '', actorId);
+      }
+      await writeSystemLog(env, {
+        level: 'audit',
+        source: 'owner-panel',
+        message: `Added verified platform Force Join destination ${resolved.destination.chatId}`,
+        actorTelegramId: actorId,
+      });
+
+      const d = resolved.destination;
+      const okText = [
+        `✅ <b>Platform Force Join Verified & Saved!</b>`,
+        `• <b>Name:</b> ${escapeHtml(d.title)}`,
+        `• <b>Numeric Chat ID:</b> <code>${escapeHtml(d.chatId)}</code>`,
+        `• <b>Join URL:</b> <code>${escapeHtml(d.inviteUrl || '')}</code>`,
+        `• <b>Master Bot Status:</b> ${escapeHtml(d.botStatus.toUpperCase())}`,
+      ].join('\n');
+
+      if (messageId) {
+        await telegram.editMessageText(token, chatId, messageId, okText).catch(() => {});
+      } else {
+        await telegram.sendMessage(token, chatId, okText, { reply_markup: kb });
+      }
       return true;
     }
-    await telegram.sendMessage(token, chatId, '❌ Use <code>toggle</code>, <code>add @Channel</code>, <code>remove @Channel</code>, or <code>clear</code>.', { reply_markup: kb });
+
+    await telegram.sendMessage(
+      token,
+      chatId,
+      '❌ Use <code>toggle</code>, <code>add @Channel</code>, <code>add https://t.me/+CODE</code>, <code>remove 1</code>, <code>reverify</code>, <code>test</code>, or <code>clear</code>.',
+      { reply_markup: kb }
+    );
     return true;
   }
 
@@ -670,8 +841,15 @@ export async function handleOwnerCallback({ env, repos, telegram, token, cb }) {
   }
 
   if (data === 'owner:toggle_maint') {
+    if (!auth.isSuperAdmin) {
+      await telegram.sendMessage(token, chatId, '🔒 Only the Super Admin can toggle Maintenance Mode.', {
+        reply_markup: buildOwnerControlReplyKeyboard(),
+      });
+      return true;
+    }
     const cur = (await repos.stats.getSettings()).map.maintenance_mode === 'true';
     await repos.stats.setSetting('maintenance_mode', String(!cur), actorId);
+    await writeSystemLog(env, { level: 'audit', source: 'owner-panel', message: `Maintenance mode set to ${!cur}`, actorTelegramId: actorId });
     await telegram.sendMessage(token, chatId, `🚧 Maintenance mode is now <b>${!cur ? 'ENABLED' : 'DISABLED'}</b>.`, {
       reply_markup: buildOwnerControlReplyKeyboard(),
     });
@@ -679,8 +857,15 @@ export async function handleOwnerCallback({ env, repos, telegram, token, cb }) {
   }
 
   if (data === 'owner:toggle_brc_pause') {
+    if (!auth.isSuperAdmin) {
+      await telegram.sendMessage(token, chatId, '🔒 Only the Super Admin can toggle Global Broadcast Emergency Pause.', {
+        reply_markup: buildOwnerControlReplyKeyboard(),
+      });
+      return true;
+    }
     const cur = (await repos.stats.getSettings()).map.emergency_pause_broadcasts === 'true';
     await repos.stats.setSetting('emergency_pause_broadcasts', String(!cur), actorId);
+    await writeSystemLog(env, { level: 'audit', source: 'owner-panel', message: `Emergency broadcast pause set to ${!cur}`, actorTelegramId: actorId });
     await telegram.sendMessage(token, chatId, `🛑 Global Broadcast Emergency Pause is now <b>${!cur ? 'ACTIVE' : 'CLEARED'}</b>.`, {
       reply_markup: buildOwnerControlReplyKeyboard(),
     });
@@ -690,6 +875,7 @@ export async function handleOwnerCallback({ env, repos, telegram, token, cb }) {
   if (data === 'owner:toggle_promo') {
     const cur = (await repos.stats.getSettings()).map.promo_footer_enabled === 'true';
     await repos.stats.setSetting('promo_footer_enabled', String(!cur), actorId);
+    await writeSystemLog(env, { level: 'audit', source: 'owner-panel', message: `Promo footer set to ${!cur}`, actorTelegramId: actorId });
     await telegram.sendMessage(token, chatId, `🔔 Promotional Broadcast Footer is now <b>${!cur ? 'ENABLED' : 'DISABLED'}</b>.`, {
       reply_markup: buildOwnerControlReplyKeyboard(),
     });

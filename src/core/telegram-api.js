@@ -192,6 +192,10 @@ export function createTelegramClient(fetchImpl = globalThis.fetch, { timeoutMs: 
       return call(token, 'sendChatAction', { chat_id: chatId, action });
     },
 
+    getChat(token, chatId) {
+      return call(token, 'getChat', { chat_id: chatId });
+    },
+
     getChatMember(token, chatId, userId) {
       return call(token, 'getChatMember', { chat_id: chatId, user_id: userId });
     },

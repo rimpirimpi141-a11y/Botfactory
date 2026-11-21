@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import { AnimatePresence, motion } from 'motion/react';
 import { CheckCircle2, Copy, ExternalLink, RefreshCw, ShieldCheck, Terminal, X, AlertCircle } from 'lucide-react';
 import type { HealthResponse, WorkerConnection } from '../api';
 import { createWorkerApi, saveConnection } from '../api';
@@ -20,8 +21,6 @@ export function SetupModal({ open, connection, health, onClose, onConnected }: S
   const [error, setError] = useState<string | null>(null);
   const [masterMsg, setMasterMsg] = useState<string | null>(null);
   const [copiedCmd, setCopiedCmd] = useState<string | null>(null);
-
-  if (!open) return null;
 
   async function handleTestAndSave(e: React.FormEvent) {
     e.preventDefault();
@@ -85,8 +84,22 @@ npx wrangler secret put ADMIN_API_KEY
 npm run worker:deploy`;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4 backdrop-blur-sm">
-      <div className="w-full max-w-2xl rounded-xl border border-slate-800 bg-[#0D1322] shadow-2xl">
+    <AnimatePresence>
+      {open && (
+        <motion.div
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          transition={{ duration: 0.16 }}
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4 backdrop-blur-sm"
+        >
+          <motion.div
+            initial={{ opacity: 0, scale: 0.96, y: 10 }}
+            animate={{ opacity: 1, scale: 1, y: 0 }}
+            exit={{ opacity: 0, scale: 0.97, y: 8 }}
+            transition={{ duration: 0.2, ease: 'easeOut' }}
+            className="w-full max-w-2xl rounded-xl border border-slate-800 bg-[#0D1322] shadow-2xl"
+          >
         <div className="flex items-center justify-between border-b border-slate-800 px-6 py-4">
           <div>
             <h2 className="font-display text-lg font-semibold text-white">Connect Cloudflare Worker</h2>
@@ -226,9 +239,11 @@ npm run worker:deploy`;
               </a>
             )}
           </div>
-        </form>
-      </div>
-    </div>
+          </form>
+          </motion.div>
+        </motion.div>
+      )}
+    </AnimatePresence>
   );
 }
 

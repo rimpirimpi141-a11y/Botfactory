@@ -15,6 +15,11 @@ import {
   BUTTON_STYLES,
   inlineButton,
 } from '../../utils/keyboards.js';
+import {
+  buildForceJoinGateKeyboard,
+  checkUserForceJoin,
+  formatDestinationLabel,
+} from '../../core/force-join.js';
 import { newId } from '../../database/repositories.js';
 import { escapeHtml } from '../../utils/validation.js';
 
@@ -215,16 +220,21 @@ async function sendFileByCode(ctx, chatId, code) {
     return;
   }
   if (file.access_level === 'force_join' && !isAdmin && (config.forceJoinChannels || []).length > 0) {
-    for (const ch of config.forceJoinChannels) {
-      try {
-        const res = await telegram.getChatMember(token, ch, endUser.telegram_id);
-        if (!['member', 'administrator', 'creator'].includes(res?.result?.status)) {
-          await telegram.sendMessage(token, chatId, `📢 Please join <b>${escapeHtml(ch)}</b> first to access this file.`);
-          return;
-        }
-      } catch {
-        // Skip unreachable channel check error
-      }
+    const fjCheck = await checkUserForceJoin({
+      telegram,
+      token,
+      destinations: config.forceJoinChannels,
+      userId: endUser.telegram_id,
+    });
+    if (!fjCheck.passed) {
+      const labels = fjCheck.missing.map((d) => `• <b>${escapeHtml(formatDestinationLabel(d))}</b>`).join('\n');
+      await telegram.sendMessage(
+        token,
+        chatId,
+        `📢 Please join the required channel(s) below first to access this file:\n\n${labels}`,
+        { reply_markup: buildForceJoinGateKeyboard(fjCheck.missing, 'fj:verify') }
+      );
+      return;
     }
   }
 

@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import { AnimatePresence, motion } from 'motion/react';
 import {
   CheckCircle2,
   ExternalLink,
@@ -239,17 +240,23 @@ export function BotsPanel({
         </div>
       </div>
 
-      {actionMsg && (
-        <div
-          className={`rounded-lg border px-4 py-2.5 text-xs ${
-            actionMsg.type === 'ok'
-              ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
-              : 'border-red-500/30 bg-red-500/10 text-red-300'
-          }`}
-        >
-          {actionMsg.text}
-        </div>
-      )}
+      <AnimatePresence>
+        {actionMsg && (
+          <motion.div
+            initial={{ opacity: 0, y: -6 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -6 }}
+            transition={{ duration: 0.16 }}
+            className={`rounded-lg border px-4 py-2.5 text-xs ${
+              actionMsg.type === 'ok'
+                ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
+                : 'border-red-500/30 bg-red-500/10 text-red-300'
+            }`}
+          >
+            {actionMsg.text}
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {/* Bot Table */}
       <div className="rounded-xl border border-slate-800/80 bg-[#0D1322]">
@@ -363,9 +370,22 @@ export function BotsPanel({
       </div>
 
       {/* Real Multi-Tenant Bot Deployment Modal */}
-      {openDeployModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4 backdrop-blur-sm">
-          <div className="animate-modal-pop max-h-[90vh] w-full max-w-2xl overflow-y-auto rounded-xl border border-slate-800 bg-[#0D1322] shadow-2xl">
+      <AnimatePresence>
+        {openDeployModal && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: 0.16 }}
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4 backdrop-blur-sm"
+          >
+            <motion.div
+              initial={{ opacity: 0, scale: 0.96, y: 10 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.97, y: 8 }}
+              transition={{ duration: 0.2, ease: 'easeOut' }}
+              className="max-h-[90vh] w-full max-w-2xl overflow-y-auto rounded-xl border border-slate-800 bg-[#0D1322] shadow-2xl"
+            >
             <div className="flex items-center justify-between border-b border-slate-800 px-6 py-4">
               <div>
                 <h2 className="font-display text-lg font-semibold text-white">Deploy Multi-Tenant Telegram Bot</h2>
@@ -632,9 +652,10 @@ export function BotsPanel({
                 </button>
               </div>
             </form>
-          </div>
-        </div>
-      )}
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }

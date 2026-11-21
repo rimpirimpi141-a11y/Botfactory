@@ -16,6 +16,7 @@ import {
   BUTTON_STYLES,
   inlineButton,
 } from '../../utils/keyboards.js';
+import { resolveAndVerifyForceJoinDestination } from '../../core/force-join.js';
 import { newId } from '../../database/repositories.js';
 import { escapeHtml } from '../../utils/validation.js';
 import {
@@ -99,46 +100,51 @@ export async function handleChannelAutomationUpdate(ctx) {
     return;
   }
 
-  // Admin: connect a channel with REAL getChatMember admin permission verification
+  // Admin: connect a channel with REAL getChat + getChatMember admin permission verification
   if (isAdmin && state?.step === 'ch_connect_input' && !text.startsWith('/')) {
     await repos.endUsers.setState(bot.id, endUser.telegram_id, null);
-    const channelRef = text.startsWith('@') || /^-100\d+$/.test(text) ? text : `@${text.replace(/^@/, '')}`;
 
-    try {
-      const me = await telegram.getMe(token);
-      const memberRes = await telegram.getChatMember(token, channelRef, me.result.id);
-      const status = memberRes?.result?.status;
-      if (!['administrator', 'creator'].includes(status)) {
-        await telegram.sendMessage(
-          token,
-          chatId,
-          `❌ <b>Permission Denied</b>\nThis bot's status in <code>${escapeHtml(channelRef)}</code> is <b>${escapeHtml(status || 'member')}</b>.\nPromote @${escapeHtml(bot.telegram_username)} to <b>Channel Administrator</b> with "Post Messages" permission and retry.`,
-          { reply_markup: adminKb }
-        );
-        return;
-      }
+    const resolved = await resolveAndVerifyForceJoinDestination({
+      telegram,
+      token,
+      rawInput: text,
+      botUsername: bot.telegram_username,
+    });
 
-      const id = newId('chn');
-      await repos.db.run(
-        `INSERT INTO connected_channels (id, bot_id, channel_id, channel_username, channel_title, verified_admin, connected_by)
-         VALUES (?, ?, ?, ?, ?, 1, ?)
-         ON CONFLICT(bot_id, channel_id) DO UPDATE SET verified_admin = 1`,
-        [id, bot.id, channelRef, channelRef.startsWith('@') ? channelRef : '', channelRef, endUser.telegram_id]
-      );
+    if (resolved.pendingPrivateLink) {
       await telegram.sendMessage(
         token,
         chatId,
-        `✅ <b>Channel Verified & Connected!</b>\nChannel: <code>${escapeHtml(channelRef)}</code>\nAdmin Permission: <b>Verified (${escapeHtml(status)})</b>`,
+        `🔐 Private channel invite links cannot be looked up via <code>getChat</code> alone.\nAdd @${escapeHtml(bot.telegram_username)} as Administrator to your private channel, then send its numeric ID paired with the invite link:\n<code>-100YOUR_CHANNEL_ID | ${escapeHtml(resolved.inviteUrl)}</code>`,
         { reply_markup: adminKb }
       );
-    } catch (err) {
-      await telegram.sendMessage(
-        token,
-        chatId,
-        `❌ <b>Channel Verification Failed</b>\nCould not verify admin rights in <code>${escapeHtml(channelRef)}</code>:\n<code>${escapeHtml(err.message || 'Telegram API error')}</code>`,
-        { reply_markup: adminKb }
-      );
+      return;
     }
+
+    if (!resolved.ok) {
+      await telegram.sendMessage(
+        token,
+        chatId,
+        `❌ <b>Channel Verification Failed</b>\n${escapeHtml(resolved.error)}`,
+        { reply_markup: adminKb }
+      );
+      return;
+    }
+
+    const d = resolved.destination;
+    const id = newId('chn');
+    await repos.db.run(
+      `INSERT INTO connected_channels (id, bot_id, channel_id, channel_username, channel_title, verified_admin, connected_by)
+       VALUES (?, ?, ?, ?, ?, 1, ?)
+       ON CONFLICT(bot_id, channel_id) DO UPDATE SET verified_admin = 1, channel_username = excluded.channel_username, channel_title = excluded.channel_title`,
+      [id, bot.id, d.chatId, d.username ? `@${d.username}` : '', d.title, endUser.telegram_id]
+    );
+    await telegram.sendMessage(
+      token,
+      chatId,
+      `✅ <b>Channel Verified & Connected!</b>\n• <b>Channel:</b> ${escapeHtml(d.title)}\n• <b>Chat ID:</b> <code>${escapeHtml(d.chatId)}</code>\n• <b>Admin Permission:</b> Verified (<b>${escapeHtml(d.botStatus)}</b>)`,
+      { reply_markup: adminKb }
+    );
     return;
   }
 

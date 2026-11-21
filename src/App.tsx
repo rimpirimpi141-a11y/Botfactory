@@ -6,8 +6,10 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { AnimatePresence, MotionConfig, motion } from 'motion/react';
 import {
+  AlertCircle,
   Award,
   Bot,
+  CheckCircle2,
   Cloud,
   LayoutDashboard,
   Layers,
@@ -86,6 +88,15 @@ export default function App() {
   const [masterDeepLink, setMasterDeepLink] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [apiError, setApiError] = useState<string | null>(null);
+  const [toasts, setToasts] = useState<Array<{ id: string; type: 'ok' | 'err'; text: string }>>([]);
+
+  const pushToast = useCallback((type: 'ok' | 'err', text: string) => {
+    const id = `${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    setToasts((prev) => [...prev.slice(-2), { id, type, text }]);
+    setTimeout(() => {
+      setToasts((prev) => prev.filter((t) => t.id !== id));
+    }, 3600);
+  }, []);
 
   const connected = Boolean(connection.workerUrl && health);
 
@@ -192,14 +203,21 @@ export default function App() {
                 <button
                   key={item.id}
                   onClick={() => setSection(item.id)}
-                  className={`flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left text-xs font-medium transition-colors whitespace-nowrap ${
+                  className={`bf-press relative flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left text-xs font-medium transition-colors whitespace-nowrap ${
                     active
-                      ? 'bg-blue-600/15 text-white'
+                      ? 'text-white'
                       : 'text-slate-400 hover:bg-slate-800/50 hover:text-slate-100'
                   }`}
                 >
-                  <Icon className={`h-4 w-4 shrink-0 ${active ? 'text-blue-400' : 'text-slate-500'}`} />
-                  <span>{item.label}</span>
+                  {active && (
+                    <motion.span
+                      layoutId="bf-nav-active-bg"
+                      transition={{ type: 'spring', stiffness: 420, damping: 34 }}
+                      className="absolute inset-0 rounded-lg border border-blue-500/30 bg-blue-600/15"
+                    />
+                  )}
+                  <Icon className={`relative z-10 h-4 w-4 shrink-0 ${active ? 'text-blue-400' : 'text-slate-500'}`} />
+                  <span className="relative z-10">{item.label}</span>
                 </button>
               );
             })}
@@ -210,14 +228,19 @@ export default function App() {
             <div className="mt-1 truncate font-mono text-[11px] text-slate-300">
               {connection.workerUrl || 'Not configured'}
             </div>
-            <div className="mt-1.5 font-mono text-[11px]">
+            <div className="mt-1.5 flex items-center gap-1.5 font-mono text-[11px]">
+              <span
+                className={`h-2 w-2 rounded-full ${
+                  connected ? 'animate-soft-pulse bg-emerald-400' : 'bg-amber-400'
+                }`}
+              />
               <span className={connected ? 'text-emerald-400' : 'text-amber-400'}>
                 {connected ? 'Connected · D1 Ready' : 'Unconnected'}
               </span>
             </div>
             <button
               onClick={() => setSetupOpen(true)}
-              className="mt-3 flex w-full items-center justify-center gap-1.5 rounded-lg border border-slate-700 px-3 py-1.5 text-xs font-medium text-slate-200 transition-colors hover:bg-slate-800 whitespace-nowrap"
+              className="bf-press mt-3 flex w-full items-center justify-center gap-1.5 rounded-lg border border-slate-700 px-3 py-1.5 text-xs font-medium text-slate-200 transition-colors hover:bg-slate-800 whitespace-nowrap"
             >
               <Plug className="h-3.5 w-3.5" />
               {connected ? 'Worker Settings' : 'Connect Worker'}
@@ -225,41 +248,56 @@ export default function App() {
           </div>
         </aside>
 
-        {/* Mobile Drawer */}
-        {mobileNavOpen && (
-          <div className="fixed inset-0 z-40 flex lg:hidden">
-            <div className="fixed inset-0 bg-black/70" onClick={() => setMobileNavOpen(false)} />
-            <aside className="relative z-10 flex w-64 flex-col border-r border-slate-800 bg-[#0A101D]">
-              <div className="flex h-16 items-center justify-between border-b border-slate-800 px-5">
-                <span className="font-display text-base font-bold text-white">BOT FACTORY</span>
-                <button onClick={() => setMobileNavOpen(false)} className="p-1.5 text-slate-400 hover:text-white">
-                  <X className="h-4 w-4" />
-                </button>
-              </div>
-              <nav className="flex-1 space-y-1 p-3">
-                {NAV_ITEMS.map((item) => {
-                  const Icon = item.icon;
-                  const active = section === item.id;
-                  return (
-                    <button
-                      key={item.id}
-                      onClick={() => {
-                        setSection(item.id);
-                        setMobileNavOpen(false);
-                      }}
-                      className={`flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left text-xs font-medium ${
-                        active ? 'bg-blue-600/15 text-white' : 'text-slate-400 hover:bg-slate-800/50 hover:text-white'
-                      }`}
-                    >
-                      <Icon className="h-4 w-4 shrink-0" />
-                      <span>{item.label}</span>
-                    </button>
-                  );
-                })}
-              </nav>
-            </aside>
-          </div>
-        )}
+        {/* Animated Mobile Drawer */}
+        <AnimatePresence>
+          {mobileNavOpen && (
+            <div className="fixed inset-0 z-40 flex lg:hidden">
+              <motion.div
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                transition={{ duration: 0.16 }}
+                className="fixed inset-0 bg-black/70 backdrop-blur-xs"
+                onClick={() => setMobileNavOpen(false)}
+              />
+              <motion.aside
+                initial={{ x: -264 }}
+                animate={{ x: 0 }}
+                exit={{ x: -264 }}
+                transition={{ type: 'spring', stiffness: 420, damping: 38 }}
+                className="relative z-10 flex w-64 flex-col border-r border-slate-800 bg-[#0A101D]"
+              >
+                <div className="flex h-16 items-center justify-between border-b border-slate-800 px-5">
+                  <span className="font-display text-base font-bold text-white">BOT FACTORY</span>
+                  <button onClick={() => setMobileNavOpen(false)} className="p-1.5 text-slate-400 hover:text-white">
+                    <X className="h-4 w-4" />
+                  </button>
+                </div>
+                <nav className="flex-1 space-y-1 p-3">
+                  {NAV_ITEMS.map((item) => {
+                    const Icon = item.icon;
+                    const active = section === item.id;
+                    return (
+                      <button
+                        key={item.id}
+                        onClick={() => {
+                          setSection(item.id);
+                          setMobileNavOpen(false);
+                        }}
+                        className={`bf-press flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left text-xs font-medium ${
+                          active ? 'bg-blue-600/15 text-white' : 'text-slate-400 hover:bg-slate-800/50 hover:text-white'
+                        }`}
+                      >
+                        <Icon className={`h-4 w-4 shrink-0 ${active ? 'text-blue-400' : 'text-slate-500'}`} />
+                        <span>{item.label}</span>
+                      </button>
+                    );
+                  })}
+                </nav>
+              </motion.aside>
+            </div>
+          )}
+        </AnimatePresence>
 
         {/* Main Content Area */}
         <div className="flex min-w-0 flex-1 flex-col">
@@ -433,9 +471,37 @@ export default function App() {
             setConnection(nextConn);
             setHealth(nextHealth);
             setSetupOpen(false);
+            pushToast('ok', `Connected to ${nextConn.workerUrl}`);
             syncWithWorker(nextConn);
           }}
         />
+
+        {/* Animated Global Toast Stack */}
+        <div className="pointer-events-none fixed right-5 bottom-5 z-50 flex flex-col gap-2">
+          <AnimatePresence>
+            {toasts.map((toast) => (
+              <motion.div
+                key={toast.id}
+                initial={{ opacity: 0, y: 12, scale: 0.96 }}
+                animate={{ opacity: 1, y: 0, scale: 1 }}
+                exit={{ opacity: 0, y: 8, scale: 0.96 }}
+                transition={{ duration: 0.18, ease: 'easeOut' }}
+                className={`pointer-events-auto flex items-center gap-2.5 rounded-xl border px-4 py-2.5 text-xs shadow-xl backdrop-blur ${
+                  toast.type === 'ok'
+                    ? 'border-emerald-500/35 bg-[#0D1A18]/95 text-emerald-200'
+                    : 'border-red-500/35 bg-[#1B1014]/95 text-red-200'
+                }`}
+              >
+                {toast.type === 'ok' ? (
+                  <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-400" />
+                ) : (
+                  <AlertCircle className="h-4 w-4 shrink-0 text-red-400" />
+                )}
+                <span>{toast.text}</span>
+              </motion.div>
+            ))}
+          </AnimatePresence>
+        </div>
       </div>
     </MotionConfig>
   );

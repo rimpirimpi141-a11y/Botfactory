@@ -28,6 +28,14 @@ import {
   handleCommonTenantAdmin,
 } from '../shared/tenant-admin.js';
 import { invalidateTenantCache } from '../../core/tenant-manager.js';
+import {
+  buildForceJoinGateKeyboard,
+  checkUserForceJoin,
+  formatDestinationLabel,
+  normalizeForceJoinList,
+  resolveAndVerifyForceJoinDestination,
+  upsertForceJoinDestination,
+} from '../../core/force-join.js';
 
 export const REFER_EARN_META = {
   id: 'tpl_refer_earn',
@@ -74,22 +82,13 @@ function buildAdminKeyboard() {
 }
 
 async function checkForceJoin({ telegram, token, channels = [], userId }) {
-  if (!Array.isArray(channels) || channels.length === 0) return { joined: true, missing: [] };
-  const missing = [];
-  for (const ch of channels) {
-    const channelRef = String(ch).trim();
-    if (!channelRef) continue;
-    try {
-      const res = await telegram.getChatMember(token, channelRef, userId);
-      const status = res?.result?.status;
-      if (!['member', 'administrator', 'creator'].includes(status)) {
-        missing.push(channelRef);
-      }
-    } catch {
-      missing.push(channelRef);
-    }
-  }
-  return { joined: missing.length === 0, missing };
+  const res = await checkUserForceJoin({
+    telegram,
+    token,
+    destinations: channels,
+    userId,
+  });
+  return { joined: res.passed, missing: res.missing, results: res.results };
 }
 
 export async function handleReferEarnUpdate(ctx) {
@@ -226,24 +225,17 @@ export async function handleReferEarnUpdate(ctx) {
       userId: endUser.telegram_id,
     });
     if (!forceCheck.joined && !isAdmin) {
-      const chRows = forceCheck.missing.map((ch) => [
-        inlineButton({
-          text: `📢 Join ${ch}`,
-          url: `https://t.me/${ch.replace(/^@/, '')}`,
-          style: BUTTON_STYLES.PRIMARY,
-        }),
-      ]);
-      chRows.push([
-        inlineButton({ text: '✅ Verify Membership', callbackData: 're:verify_join', style: BUTTON_STYLES.SUCCESS }),
-      ]);
+      const missingLines = forceCheck.missing
+        .map((d) => `• <b>${escapeHtml(formatDestinationLabel(d))}</b>`)
+        .join('\n');
       await telegram.sendMessage(
         token,
         chatId,
         formatBrandedMessage(config, {
           heading: '📢 Channel Membership Required',
-          body: 'Please join the required channels below to unlock all features, then tap <b>Verify Membership</b>.',
+          body: `Please join the required channels/groups below to unlock all features, then tap <b>Verify Membership</b>:\n\n${missingLines}`,
         }),
-        { reply_markup: buildInlineKeyboard(chRows) }
+        { reply_markup: buildForceJoinGateKeyboard(forceCheck.missing, 're:verify_join') }
       );
       return;
     }
@@ -697,14 +689,49 @@ async function handleStatefulInput(ctx, settings, state, text) {
   if (isAdmin && state.step === 'adm_set_channels') {
     await repos.endUsers.setState(bot.id, endUser.telegram_id, null);
     const adminKb = buildTenantAdminReplyKeyboard(ADMIN_EXTRA_BUTTONS);
-    const channels = text.toLowerCase() === 'clear'
-      ? []
-      : text.split(/[\s,]+/).map((s) => s.trim()).filter((s) => s.startsWith('@'));
-    await repos.botConfigs.upsert(bot.id, { ...config, forceJoinChannels: channels });
-    await invalidateTenantCache(ctx.env, bot.id);
-    await telegram.sendMessage(token, chatId, `✅ Force-join channels updated: ${channels.length ? channels.join(', ') : 'None'}`, {
-      reply_markup: adminKb,
+    if (text.toLowerCase() === 'clear') {
+      await repos.botConfigs.upsert(bot.id, { ...config, forceJoinChannels: [] });
+      await invalidateTenantCache(ctx.env, bot.id);
+      await telegram.sendMessage(token, chatId, '✅ Force-join channels cleared.', { reply_markup: adminKb });
+      return true;
+    }
+    const resolved = await resolveAndVerifyForceJoinDestination({
+      telegram,
+      token,
+      rawInput: text,
+      botUsername: bot.telegram_username,
     });
+    if (resolved.pendingPrivateLink) {
+      await repos.botConfigs.upsert(bot.id, {
+        ...config,
+        templateSettings: {
+          ...(config.templateSettings || {}),
+          pendingForceJoinLink: {
+            inviteUrl: resolved.inviteUrl,
+            inviteCode: resolved.inviteCode,
+            requestedBy: String(endUser.telegram_id),
+            chatId: String(chatId),
+            requestedAt: new Date().toISOString(),
+          },
+        },
+      });
+      await invalidateTenantCache(ctx.env, bot.id);
+      await telegram.sendMessage(token, chatId, resolved.instructions, { reply_markup: adminKb });
+      return true;
+    }
+    if (!resolved.ok) {
+      await telegram.sendMessage(token, chatId, `❌ ${escapeHtml(resolved.error)}`, { reply_markup: adminKb });
+      return true;
+    }
+    const updated = upsertForceJoinDestination(config.forceJoinChannels || [], resolved.destination);
+    await repos.botConfigs.upsert(bot.id, { ...config, forceJoinChannels: updated });
+    await invalidateTenantCache(ctx.env, bot.id);
+    await telegram.sendMessage(
+      token,
+      chatId,
+      `✅ Verified & added Force-Join destination: <b>${escapeHtml(formatDestinationLabel(resolved.destination))}</b> (<code>${escapeHtml(resolved.destination.chatId)}</code>)`,
+      { reply_markup: adminKb }
+    );
     return true;
   }
 
@@ -754,7 +781,10 @@ async function handleCallback(ctx, settings) {
       userId: endUser.telegram_id,
     });
     if (!check.joined) {
-      await telegram.sendMessage(token, chatId, `❌ Still missing membership in: ${check.missing.join(', ')}`);
+      const missingLabels = check.missing.map((d) => escapeHtml(formatDestinationLabel(d))).join(', ');
+      await telegram.sendMessage(token, chatId, `❌ Still missing membership in: <b>${missingLabels}</b>`, {
+        reply_markup: buildForceJoinGateKeyboard(check.missing, 're:verify_join'),
+      });
       return;
     }
     await telegram.sendMessage(token, chatId, '✅ Channel membership verified! Welcome aboard.', {
@@ -833,10 +863,11 @@ async function handleCallback(ctx, settings) {
   }
 
   if (data === 're:adm:settings') {
+    const fjLabels = normalizeForceJoinList(config.forceJoinChannels || []).map((d) => formatDestinationLabel(d));
     await telegram.sendMessage(
       token,
       chatId,
-      `<b>⚙️ Current Refer & Earn Settings</b>\n• Referral Reward: <b>${settings.referralReward}</b>\n• Daily Bonus: <b>${settings.dailyBonus}</b>\n• Cooldown: <b>${settings.dailyBonusCooldownHours}h</b>\n• Min Withdrawal: <b>${settings.minWithdrawalPoints}</b>\n• Force-Join: ${(config.forceJoinChannels || []).join(', ') || 'Disabled'}`
+      `<b>⚙️ Current Refer & Earn Settings</b>\n• Referral Reward: <b>${settings.referralReward}</b>\n• Daily Bonus: <b>${settings.dailyBonus}</b>\n• Cooldown: <b>${settings.dailyBonusCooldownHours}h</b>\n• Min Withdrawal: <b>${settings.minWithdrawalPoints}</b>\n• Force-Join: ${fjLabels.length ? escapeHtml(fjLabels.join(', ')) : 'Disabled'}`
     );
     return;
   }

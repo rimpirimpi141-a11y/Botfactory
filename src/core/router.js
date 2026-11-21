@@ -19,6 +19,7 @@ import {
   invalidateTenantCache,
   validateTokenForDeployment,
 } from './tenant-manager.js';
+import { resolveAndVerifyForceJoinDestination } from './force-join.js';
 import {
   buildMasterWebhookUrl,
   inspectWebhookStatus,
@@ -640,7 +641,7 @@ export async function routeRequest(request, env, ctx, { fetchImpl = globalThis.f
         return jsonResponse({ ok: true, deployments }, 200, env);
       }
 
-      // Verify Master Bot Channel Membership / Admin Rights for Platform Force Join
+      // Verify Master Bot Channel/Group Admin Rights for Platform Force Join (Public & Private aware)
       if (method === 'POST' && path === '/api/force-join/verify') {
         if (!env.MASTER_BOT_TOKEN) {
           return jsonResponse({ ok: false, error: 'MASTER_BOT_TOKEN is not configured.' }, 400, env);
@@ -648,19 +649,64 @@ export async function routeRequest(request, env, ctx, { fetchImpl = globalThis.f
         const body = await request.json();
         const channel = String(body?.channel || '').trim();
         if (!channel) return jsonResponse({ ok: false, error: 'channel is required.' }, 400, env);
-        const me = await telegram.getMe(env.MASTER_BOT_TOKEN);
-        const member = await telegram.getChatMember(env.MASTER_BOT_TOKEN, channel, me.result.id);
-        const status = member?.result?.status || 'unknown';
-        const isAdmin = ['administrator', 'creator'].includes(status);
+
+        const resolved = await resolveAndVerifyForceJoinDestination({
+          telegram,
+          token: env.MASTER_BOT_TOKEN,
+          rawInput: channel,
+          botUsername: env.MASTER_BOT_USERNAME || '',
+        });
+
+        if (resolved.pendingPrivateLink) {
+          const pendingLink = {
+            inviteUrl: resolved.inviteUrl,
+            inviteCode: resolved.inviteCode,
+            requestedBy: ownerId,
+            chatId: ownerId,
+            requestedAt: new Date().toISOString(),
+          };
+          await repos.stats.setSetting('platform_force_join_pending', JSON.stringify(pendingLink), ownerId);
+          return jsonResponse(
+            {
+              ok: true,
+              pendingPrivateLink: true,
+              inviteUrl: resolved.inviteUrl,
+              botUsername: resolved.botUsername,
+              isAdmin: false,
+              botIsAdmin: false,
+              status: 'pending_private_link',
+              message:
+                'Private invite link saved as pending. Add the Master Bot to your private channel/group and promote it to Administrator to automatically link the numeric chat ID.',
+            },
+            200,
+            env
+          );
+        }
+
+        if (!resolved.ok) {
+          return jsonResponse(
+            {
+              ok: false,
+              channel,
+              isAdmin: false,
+              botIsAdmin: false,
+              status: resolved.botStatus || 'error',
+              error: resolved.error,
+            },
+            400,
+            env
+          );
+        }
+
         return jsonResponse(
           {
             ok: true,
-            channel,
-            botUsername: me.result.username,
-            memberStatus: status,
-            status,
-            isAdmin,
-            botIsAdmin: isAdmin,
+            channel: resolved.destination.chatId,
+            destination: resolved.destination,
+            memberStatus: resolved.destination.botStatus,
+            status: resolved.destination.botStatus,
+            isAdmin: true,
+            botIsAdmin: true,
           },
           200,
           env

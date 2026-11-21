@@ -600,10 +600,16 @@ export function createWorkerApi(conn: WorkerConnection) {
     listDeployments: () =>
       request<{ ok: boolean; deployments: DeploymentLogRecord[] }>('/api/deployments'),
     verifyForceJoin: (channel: string) =>
-      request<{ ok: boolean; channel: string; botIsAdmin: boolean; status: string; error?: string }>(
-        '/api/force-join/verify',
-        { method: 'POST', body: JSON.stringify({ channel }) }
-      ),
+      request<{
+        ok: boolean;
+        channel?: string;
+        botIsAdmin: boolean;
+        status: string;
+        pendingPrivateLink?: boolean;
+        inviteUrl?: string;
+        message?: string;
+        error?: string;
+      }>('/api/force-join/verify', { method: 'POST', body: JSON.stringify({ channel }) }),
     listLogs: (level = '') =>
       request<{ ok: boolean; logs: SystemLogRecord[] }>(`/api/logs${level ? `?level=${encodeURIComponent(level)}` : ''}`),
     getSettings: () => request<{ ok: boolean; settings: Record<string, string> }>('/api/settings'),

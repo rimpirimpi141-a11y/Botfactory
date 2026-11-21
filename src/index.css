@@ -86,6 +86,17 @@
   }
 }
 
+@keyframes bf-soft-pulse {
+  0%, 100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.55;
+    transform: scale(0.92);
+  }
+}
+
 .animate-fade-slide-up {
   animation: bf-fade-slide-up 240ms cubic-bezier(0.16, 1, 0.3, 1) both;
 }
@@ -99,6 +110,27 @@
   animation: bf-bar-grow 420ms cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 
+.animate-soft-pulse {
+  animation: bf-soft-pulse 2.2s ease-in-out infinite;
+}
+
+.bf-card-interactive {
+  transition: transform 180ms cubic-bezier(0.16, 1, 0.3, 1), border-color 180ms ease, background-color 180ms ease;
+  will-change: transform;
+}
+
+.bf-card-interactive:hover {
+  transform: translateY(-2px);
+}
+
+.bf-press {
+  transition: transform 120ms cubic-bezier(0.16, 1, 0.3, 1), background-color 150ms ease, border-color 150ms ease;
+}
+
+.bf-press:active:not(:disabled) {
+  transform: scale(0.98);
+}
+
 .bf-skeleton {
   background: linear-gradient(90deg, #131c31 25%, #1e293b 50%, #131c31 75%);
   background-size: 200% 100%;
@@ -109,8 +141,14 @@
   .animate-fade-slide-up,
   .animate-modal-pop,
   .animate-bar-grow,
+  .animate-soft-pulse,
   .bf-skeleton {
     animation: none;
   }
+  .bf-card-interactive:hover,
+  .bf-press:active {
+    transform: none;
+  }
 }
+
 

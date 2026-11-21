@@ -36,8 +36,16 @@ import {
   getPlanCatalog,
 } from './plans-referrals.js';
 import {
+  buildForceJoinGateKeyboard,
+  checkUserForceJoin,
+  formatDestinationLabel,
+  handleForceJoinChatMemberUpdate,
+  normalizeForceJoinList,
+} from './force-join.js';
+import {
   buildBotLiveActionKeyboard,
   formatBotLiveSuccessCard,
+  runAnimatedOperation,
   runAnimatedStages,
   withLoadingMessage,
 } from '../utils/animations.js';
@@ -60,6 +68,49 @@ export async function handleMasterBotUpdate({ env, repos, telegram, update }) {
 
   if (await isDuplicateWebhookUpdate(env?.KV, 'master', update?.update_id)) {
     return { ok: true, deduplicated: true };
+  }
+
+  // Handle Master Bot my_chat_member / chat_member updates for private Platform Force Join linking
+  if (update?.my_chat_member || update?.chat_member) {
+    const settings = await repos.stats.getSettings();
+    let existing = [];
+    let pendingLink = null;
+    try {
+      existing = JSON.parse(settings.map.platform_force_join_channels || '[]');
+    } catch {
+      existing = [];
+    }
+    try {
+      pendingLink = settings.map.platform_force_join_pending
+        ? JSON.parse(settings.map.platform_force_join_pending)
+        : null;
+    } catch {
+      pendingLink = null;
+    }
+
+    const fjEvent = await handleForceJoinChatMemberUpdate({
+      telegram,
+      token,
+      update,
+      pendingLink,
+      existingDestinations: existing,
+      botUsername: env.MASTER_BOT_USERNAME || settings.map.master_bot_username || '',
+    });
+
+    if (fjEvent.handled) {
+      const actorId = String(pendingLink?.requestedBy || env.ADMIN_TELEGRAM_ID || 'system');
+      if (fjEvent.action === 'linked') {
+        await repos.stats.setSetting('platform_force_join_channels', JSON.stringify(fjEvent.destinations), actorId);
+        await repos.stats.setSetting('platform_force_join_pending', '', actorId);
+      } else if (fjEvent.action === 'demoted') {
+        await repos.stats.setSetting('platform_force_join_channels', JSON.stringify(fjEvent.destinations), actorId);
+      }
+      const notifyTarget = fjEvent.notifyChatId || env.ADMIN_TELEGRAM_ID;
+      if (notifyTarget && fjEvent.message) {
+        await telegram.sendMessage(token, notifyTarget, fjEvent.message).catch(() => {});
+      }
+      return { ok: true, forceJoinAction: fjEvent.action };
+    }
   }
 
   const tgUser = update?.message?.from || update?.callback_query?.from;
@@ -165,7 +216,8 @@ async function handleMasterMessage({ env, repos, telegram, token, msg, user, isO
   const wizard = await repos.users.getWizardState(telegramId);
 
   // Route Owner Control Center 12-button native ReplyKeyboard & stateful owner inputs first
-  if (isOwner && (isOwnerMenuButton(text) || wizard?.flow === 'owner_panel')) {
+  // (Also rejects unauthorized users tapping any Owner Control Center button!)
+  if (isOwnerMenuButton(text) || (isOwner && wizard?.flow === 'owner_panel')) {
     const handled = await handleOwnerMessage({ env, repos, telegram, token, msg, user, wizard });
     if (handled) return { ok: true };
   }
@@ -222,10 +274,12 @@ async function handleMasterMessage({ env, repos, telegram, token, msg, user, isO
 
     case MASTER_MAIN_BUTTONS.OWNER_CENTER:
     case '/owner':
+    case '/admin':
       if (!isOwner) {
-        await telegram.sendMessage(token, chatId, '🔒 Restricted to BOT FACTORY platform administrators.');
+        await telegram.sendMessage(token, chatId, '🔒 Unauthorized. Restricted to BOT FACTORY platform administrators.');
         return { ok: true };
       }
+      await repos.users.setWizardState(telegramId, null);
       await renderOwnerControlCenter({ env, repos, telegram, token, chatId });
       return { ok: true };
 
@@ -453,12 +507,26 @@ async function handleMasterCallback({ env, repos, telegram, token, cb, user, isO
     const bot = await repos.bots.getById(botId);
     if (!bot || (bot.owner_telegram_id !== telegramId && !isOwner)) return { ok: true };
     try {
-      const res = await enableAndVerifyTenantBot({ env, repos, telegram, botId, actorTelegramId: telegramId });
-      await telegram.sendMessage(
+      const { messageId, result: res } = await runAnimatedOperation({
+        telegram,
         token,
         chatId,
-        `🟢 Bot @${escapeHtml(bot.telegram_username)} is LIVE!\nVerified Webhook: <code>${escapeHtml(res.verification.webhookUrl)}</code>`
-      );
+        title: `🔄 Verifying @${bot.telegram_username}`,
+        minStepIntervalMs: 550,
+        steps: [
+          {
+            label: 'Registering & verifying webhook via Telegram getWebhookInfo...',
+            doneLabel: 'Webhook verified',
+            run: () => enableAndVerifyTenantBot({ env, repos, telegram, botId, actorTelegramId: telegramId }),
+          },
+        ],
+      });
+      const okMsg = `🟢 Bot @${escapeHtml(bot.telegram_username)} is LIVE!\nVerified Webhook: <code>${escapeHtml(res.verification.webhookUrl)}</code>`;
+      if (messageId) {
+        await telegram.editMessageText(token, chatId, messageId, okMsg).catch(() => {});
+      } else {
+        await telegram.sendMessage(token, chatId, okMsg);
+      }
     } catch (err) {
       await telegram.sendMessage(token, chatId, `❌ Webhook verification failed: ${escapeHtml(err.message)}`);
     }
@@ -497,57 +565,33 @@ async function checkPlatformForceJoin({ repos, telegram, token, telegramId }) {
   }
   let channels = [];
   try {
-    channels = JSON.parse(settings.map.platform_force_join_channels || '[]');
+    channels = normalizeForceJoinList(JSON.parse(settings.map.platform_force_join_channels || '[]'));
   } catch {
     channels = [];
   }
-  if (!Array.isArray(channels) || !channels.length) {
+  if (!channels.length) {
     return { ok: true, missing: [] };
   }
 
-  const missing = [];
-  for (const ch of channels) {
-    const channelId = typeof ch === 'string' ? ch : ch.id || ch.username;
-    if (!channelId) continue;
-    try {
-      const member = await telegram.getChatMember(token, channelId, telegramId);
-      const memberStatus = member?.result?.status ?? member?.status;
-      if (!memberStatus || ['left', 'kicked'].includes(memberStatus)) {
-        missing.push(channelId);
-      }
-    } catch {
-      missing.push(channelId);
-    }
-  }
-  return { ok: missing.length === 0, missing };
+  const check = await checkUserForceJoin({
+    telegram,
+    token,
+    destinations: channels,
+    userId: telegramId,
+  });
+  return { ok: check.passed, missing: check.missing, results: check.results };
 }
 
 async function startCreateBotWizard({ env, repos, telegram, token, chatId, telegramId, user, forceCustom = false }) {
   // 1. Real Platform Force Join Verification (when enabled by owner)
   const fj = await checkPlatformForceJoin({ repos, telegram, token, telegramId });
   if (!fj.ok) {
-    const rows = fj.missing.map((ch) => {
-      const handle = String(ch).replace(/^@/, '');
-      return [
-        inlineButton({
-          text: `📢 Join ${ch}`,
-          url: `https://t.me/${handle}`,
-          style: BUTTON_STYLES.PRIMARY,
-        }),
-      ];
-    });
-    rows.push([
-      inlineButton({
-        text: '✅ I Joined — Verify Now',
-        callbackData: 'mb:force_join_recheck',
-        style: BUTTON_STYLES.SUCCESS,
-      }),
-    ]);
+    const missingLines = fj.missing.map((d) => `• <b>${escapeHtml(formatDestinationLabel(d))}</b>`).join('\n');
     await telegram.sendMessage(
       token,
       chatId,
-      '🔒 <b>Channel Membership Required</b>\n\nJoin the required BOT FACTORY channel(s) below and tap <b>✅ I Joined — Verify Now</b> to continue:',
-      { reply_markup: buildInlineKeyboard(rows) }
+      `🔒 <b>Channel Membership Required</b>\n\nJoin the required BOT FACTORY channel(s)/group(s) below and tap <b>✅ I Joined — Verify Membership</b> to continue:\n\n${missingLines}`,
+      { reply_markup: buildForceJoinGateKeyboard(fj.missing, 'mb:force_join_recheck') }
     );
     return;
   }

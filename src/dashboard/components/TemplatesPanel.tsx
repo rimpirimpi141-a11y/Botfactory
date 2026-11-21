@@ -1,4 +1,5 @@
 import React, { useMemo, useState } from 'react';
+import { AnimatePresence, motion } from 'motion/react';
 import { ArrowRight, Clock, Database, ShieldCheck, Wrench } from 'lucide-react';
 import { TEMPLATE_CATALOG, type TemplateBlueprint } from '../catalog';
 import { createWorkerApi, type TemplateStudioRecord, type WorkerConnection } from '../api';
@@ -114,16 +115,19 @@ export function TemplatesPanel({
       <div className="grid gap-6 lg:grid-cols-12">
         {/* Template List */}
         <div className="space-y-2.5 lg:col-span-5">
-          {filteredTemplates.map((tpl) => {
+          {filteredTemplates.map((tpl, idx) => {
             const active = selected.id === tpl.id;
             const live = liveBySlug.get(tpl.slug);
             const status = tpl.isComingSoon ? 'coming_soon' : live?.availability_status || tpl.availabilityStatus;
 
             return (
-              <button
+              <motion.button
                 key={tpl.id}
+                initial={{ opacity: 0, y: 8 }}
+                animate={{ opacity: 1, y: 0 }}
+                transition={{ duration: 0.18, delay: Math.min(idx * 0.03, 0.28), ease: 'easeOut' }}
                 onClick={() => setSelected(tpl)}
-                className={`w-full rounded-xl border p-4 text-left transition-colors ${
+                className={`bf-card-interactive bf-press w-full rounded-xl border p-4 text-left ${
                   active
                     ? 'border-blue-500 bg-[#131B2E]'
                     : tpl.isComingSoon
@@ -149,13 +153,22 @@ export function TemplatesPanel({
                   {tpl.category} · <span className="font-mono text-slate-500">{tpl.slug}</span>
                 </div>
                 <p className="mt-2 line-clamp-2 text-xs leading-relaxed text-slate-400">{tpl.description}</p>
-              </button>
+              </motion.button>
             );
           })}
         </div>
 
         {/* Selected Template Architecture Inspector */}
-        <div className="rounded-xl border border-slate-800/80 bg-[#0D1322] p-6 lg:col-span-7">
+        <div className="lg:col-span-7">
+          <AnimatePresence mode="wait">
+            <motion.div
+              key={selected.id}
+              initial={{ opacity: 0, y: 6 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -4 }}
+              transition={{ duration: 0.15, ease: 'easeOut' }}
+              className="rounded-xl border border-slate-800/80 bg-[#0D1322] p-6"
+            >
           <div className="flex flex-wrap items-start justify-between gap-4 border-b border-slate-800 pb-5">
             <div>
               <div className="text-xs text-slate-400">
@@ -296,6 +309,8 @@ export function TemplatesPanel({
               </div>
             </div>
           </div>
+            </motion.div>
+          </AnimatePresence>
         </div>
       </div>
     </div>

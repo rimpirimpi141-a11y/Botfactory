@@ -47,6 +47,14 @@ import { evaluateCampaignEligibility } from '../src/templates/festive-bonus/inde
 import { dispatchDueScheduledPosts } from '../src/templates/channel-automation/index.js';
 import { getCloudflareInfrastructureMetrics } from '../src/admin/cloudflare-monitor.js';
 import { redactString } from '../src/utils/logger.js';
+import {
+  buildForceJoinGateKeyboard,
+  checkUserForceJoin,
+  parseForceJoinInput,
+  resolveAndVerifyForceJoinDestination,
+  reverifyForceJoinDestinations,
+} from '../src/core/force-join.js';
+import { runAnimatedOperation } from '../src/utils/animations.js';
 
 /**
  * Creates a real SQL-backed D1 binding adapter for testing the actual SQL migrations & queries.
@@ -559,7 +567,7 @@ test('Master Bot manual webhook registration sets exact URL, secret_token, allow
   assert.ok(setCall, 'Expected setWebhook to be called');
   assert.equal(setCall.body.url, `${workerUrl}/webhook/master`);
   assert.equal(setCall.body.secret_token, env.MASTER_WEBHOOK_SECRET);
-  assert.deepEqual(setCall.body.allowed_updates, ['message', 'callback_query']);
+  assert.deepEqual(setCall.body.allowed_updates, ['message', 'callback_query', 'chat_member', 'my_chat_member']);
 
   // Verify getWebhookInfo was called AFTER setWebhook
   const infoCallIndex = calls.findIndex((c) => c.method === 'getWebhookInfo');
@@ -1727,5 +1735,498 @@ test('Tenant templates execute real D1 transactions cleanly (Refer & Earn, Tenan
   );
   assert.ok(forwarded, 'Secretary Mode must forward admin message directly to verified connected channel');
 });
+
+// ============================================================================
+// 26. FORCE JOIN INPUT PARSER — ALL FORMATS + MALFORMED REJECTION (NO "@https://")
+// ============================================================================
+test('Force Join parser handles public/private channels & groups and never prepends @ to URLs', () => {
+  // 1. Public channel @username
+  const p1 = parseForceJoinInput('@OfficialUpdates');
+  assert.equal(p1.ok, true);
+  assert.equal(p1.kind, 'public');
+  assert.equal(p1.username, 'OfficialUpdates');
+  assert.equal(p1.handle, '@OfficialUpdates');
+  assert.equal(p1.joinUrl, 'https://t.me/OfficialUpdates');
+
+  // 2. Public channel URL (https://t.me/channelusername)
+  const p2 = parseForceJoinInput('https://t.me/public_channel_1');
+  assert.equal(p2.ok, true);
+  assert.equal(p2.kind, 'public');
+  assert.equal(p2.handle, '@public_channel_1');
+  assert.equal(p2.joinUrl, 'https://t.me/public_channel_1');
+
+  // 3. Public channel post URL (https://t.me/channelusername/123)
+  const p3 = parseForceJoinInput('https://t.me/news_channel/456');
+  assert.equal(p3.ok, true);
+  assert.equal(p3.kind, 'public');
+  assert.equal(p3.username, 'news_channel');
+  assert.equal(p3.joinUrl, 'https://t.me/news_channel');
+
+  // 4. Public group URL
+  const p4 = parseForceJoinInput('t.me/community_group');
+  assert.equal(p4.ok, true);
+  assert.equal(p4.kind, 'public');
+  assert.equal(p4.handle, '@community_group');
+
+  // 5. Private channel/group invite link https://t.me/+INVITECODE (MUST NOT prepend @!)
+  const p5 = parseForceJoinInput('https://t.me/+AbCdEf123456_xyz');
+  assert.equal(p5.ok, true);
+  assert.equal(p5.kind, 'private_invite');
+  assert.equal(p5.inviteUrl, 'https://t.me/+AbCdEf123456_xyz');
+  assert.equal(p5.inviteUrl.startsWith('@'), false);
+
+  // 6. Legacy private invite link https://t.me/joinchat/INVITECODE
+  const p6 = parseForceJoinInput('https://t.me/joinchat/LegacyInviteHash99');
+  assert.equal(p6.ok, true);
+  assert.equal(p6.kind, 'private_invite');
+  assert.equal(p6.inviteUrl, 'https://t.me/joinchat/LegacyInviteHash99');
+
+  // 7. Numeric chat_id & explicit chat_id | invite pair
+  const p7 = parseForceJoinInput('-1001987654321 | https://t.me/+PairInvite99');
+  assert.equal(p7.ok, true);
+  assert.equal(p7.kind, 'chat_id_with_invite');
+  assert.equal(p7.chatId, '-1001987654321');
+  assert.equal(p7.inviteUrl, 'https://t.me/+PairInvite99');
+
+  // 8. Malformed / non-Telegram / @https:// links rejected with helpful errors
+  assert.equal(parseForceJoinInput('@https://t.me/+AbCdEf123').ok, false);
+  assert.equal(parseForceJoinInput('https://google.com/channel').ok, false);
+  assert.equal(parseForceJoinInput('https://t.me/').ok, false);
+  assert.equal(parseForceJoinInput('https://t.me/+bad').ok, false);
+  assert.equal(parseForceJoinInput('https://t.me/c/123456789/10').ok, false);
+  assert.equal(parseForceJoinInput('@ab').ok, false);
+});
+
+// ============================================================================
+// 27. FORCE JOIN PUBLIC RESOLUTION, ADMIN VERIFICATION & NON-ADMIN REJECTION
+// ============================================================================
+test('Force Join resolves public chats via getChat, verifies bot admin via getChatMember, and rejects non-admin bots', async () => {
+  const { fetchImpl, calls } = createMockTelegramFetch({
+    getChat: async ({ body }) => {
+      if (body.chat_id === '@VerifiedPub') {
+        return {
+          body: {
+            ok: true,
+            result: { id: -1001122334455, type: 'channel', title: 'Verified Public Channel', username: 'VerifiedPub' },
+          },
+        };
+      }
+      if (body.chat_id === '@NotAdminGroup') {
+        return {
+          body: {
+            ok: true,
+            result: { id: -1005544332211, type: 'supergroup', title: 'Non-Admin Group', username: 'NotAdminGroup' },
+          },
+        };
+      }
+      return { status: 400, body: { ok: false, error_code: 400, description: 'Bad Request: chat not found' } };
+    },
+    getChatMember: async ({ body }) => {
+      if (String(body.chat_id) === '-1001122334455') {
+        return { body: { ok: true, result: { status: 'administrator' } } };
+      }
+      return { body: { ok: true, result: { status: 'member' } } };
+    },
+  });
+  const telegram = createTelegramClient(fetchImpl);
+  const token = '8810001:AAH_ForceJoinPubTest_ValidToken_123456789';
+
+  // Public URL resolves numeric chat_id and verifies administrator status
+  const okRes = await resolveAndVerifyForceJoinDestination({
+    telegram,
+    token,
+    rawInput: 'https://t.me/VerifiedPub/789',
+    botUsername: 'tenant_test_bot',
+  });
+  assert.equal(okRes.ok, true);
+  assert.equal(okRes.destination.chatId, '-1001122334455');
+  assert.equal(okRes.destination.username, 'VerifiedPub');
+  assert.equal(okRes.destination.inviteUrl, 'https://t.me/VerifiedPub');
+  assert.equal(okRes.destination.isPrivate, false);
+  assert.equal(okRes.destination.verified, true);
+  // Ensure getChat was called with '@VerifiedPub' (NEVER '@https://...')
+  assert.ok(calls.some((c) => c.method === 'getChat' && c.body.chat_id === '@VerifiedPub'));
+
+  // Bot not admin -> rejected honestly, never silently saved
+  const nonAdminRes = await resolveAndVerifyForceJoinDestination({
+    telegram,
+    token,
+    rawInput: 'https://t.me/NotAdminGroup',
+    botUsername: 'tenant_test_bot',
+  });
+  assert.equal(nonAdminRes.ok, false);
+  assert.equal(nonAdminRes.needsAdmin, true);
+  assert.match(nonAdminRes.error, /Administrator/i);
+
+  // Private invite link -> never passed to getChat, returns honest pendingPrivateLink instructions
+  const privRes = await resolveAndVerifyForceJoinDestination({
+    telegram,
+    token,
+    rawInput: 'https://t.me/+PrivateSecretCode88',
+    botUsername: 'tenant_test_bot',
+  });
+  assert.equal(privRes.ok, false);
+  assert.equal(privRes.pendingPrivateLink, true);
+  assert.equal(privRes.inviteUrl, 'https://t.me/+PrivateSecretCode88');
+  assert.equal(
+    calls.some((c) => c.method === 'getChat' && String(c.body.chat_id).includes('PrivateSecretCode88')),
+    false,
+    'Private invite links must NEVER be sent to Telegram getChat'
+  );
+});
+
+// ============================================================================
+// 28. FORCE JOIN PRIVATE LINKING VIA my_chat_member + MEMBERSHIP CHECKING
+//     (creator, administrator, member, restricted is_member true/false, left, kicked)
+//     + MULTI-TENANT ISOLATION + MULTI-CHANNEL ADD/REMOVE/CLEAR/REVERIFY
+// ============================================================================
+test('Private Force Join links via my_chat_member, enforces numeric chat_id membership statuses, and isolates tenants', async () => {
+  const env = buildTestEnv();
+  const db = createDbClient(env.DB);
+  const repos = createRepositories(db, env);
+
+  const memberStatuses = new Map([
+    ['-100999888777:70001', { status: 'creator' }],
+    ['-100999888777:70002', { status: 'administrator' }],
+    ['-100999888777:70003', { status: 'member' }],
+    ['-100999888777:70004', { status: 'restricted', is_member: true }],
+    ['-100999888777:70005', { status: 'restricted', is_member: false }],
+    ['-100999888777:70006', { status: 'left' }],
+    ['-100999888777:70007', { status: 'kicked' }],
+  ]);
+
+  const { fetchImpl, calls } = createMockTelegramFetch({
+    getChat: async ({ body }) => {
+      if (String(body.chat_id) === '-100999888777') {
+        return { body: { ok: true, result: { id: -100999888777, type: 'channel', title: 'VIP Private Club' } } };
+      }
+      if (body.chat_id === '@SecondPublicCh' || String(body.chat_id) === '-100222333444') {
+        return {
+          body: { ok: true, result: { id: -100222333444, type: 'channel', title: 'Second Public', username: 'SecondPublicCh' } },
+        };
+      }
+      return { status: 400, body: { ok: false, error_code: 400, description: 'Bad Request: chat not found' } };
+    },
+    getChatMember: async ({ body }) => {
+      const key = `${body.chat_id}:${body.user_id}`;
+      // Bot itself is administrator in both channels
+      if (String(body.user_id) === '8900001' || String(body.user_id) === '8900002') {
+        return { body: { ok: true, result: { status: 'administrator' } } };
+      }
+      if (memberStatuses.has(key)) {
+        return { body: { ok: true, result: memberStatuses.get(key) } };
+      }
+      return { body: { ok: true, result: { status: 'left' } } };
+    },
+  });
+
+  const telegram = createTelegramClient(fetchImpl);
+  await repos.users.upsertFromTelegram({ id: 59001, username: 'tenant_owner', first_name: 'Tenant' });
+
+  // Deploy Bot A (APK Store) and Bot B (SMM Panel) to verify strict per-tenant isolation
+  const botA = (
+    await deployTenantBot({
+      env,
+      repos,
+      telegram,
+      ownerTelegramId: '59001',
+      rawToken: '8900001:AAH_TenantBotA_ValidToken_1234567890abcdef',
+      templateId: 'tpl_apk_store',
+      displayName: 'APK Tenant A',
+    })
+  ).bot;
+
+  const botB = (
+    await deployTenantBot({
+      env,
+      repos,
+      telegram,
+      ownerTelegramId: '59001',
+      rawToken: '8900002:AAH_TenantBotB_ValidToken_1234567890abcdef',
+      templateId: 'tpl_smm_panel',
+      displayName: 'SMM Tenant B',
+    })
+  ).bot;
+
+  const sendUpdate = (bot, update) =>
+    routeRequest(
+      new Request(`https://bot-factory.example.workers.dev/webhook/${bot.id}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Telegram-Bot-Api-Secret-Token': bot.webhook_secret },
+        body: JSON.stringify(update),
+      }),
+      env,
+      {},
+      { fetchImpl }
+    );
+
+  // Step 1: Tenant admin opens Force Join & submits private invite link https://t.me/+VipSecret999
+  await sendUpdate(botA, {
+    update_id: 95001,
+    message: { chat: { id: 59001, type: 'private' }, from: { id: 59001, first_name: 'Tenant' }, text: '📣 Force Join' },
+  });
+  await sendUpdate(botA, {
+    update_id: 95002,
+    message: {
+      chat: { id: 59001, type: 'private' },
+      from: { id: 59001, first_name: 'Tenant' },
+      text: 'https://t.me/+VipSecret999',
+    },
+  });
+
+  // Verify pending link was stored (NOT falsely saved as active verified destination yet!)
+  const cfgPending = await repos.botConfigs.getByBotId(botA.id);
+  assert.equal(cfgPending.forceJoinChannels.length, 0, 'Private link must NOT be saved as active until my_chat_member arrives');
+  assert.equal(cfgPending.templateSettings.pendingForceJoinLink.inviteUrl, 'https://t.me/+VipSecret999');
+
+  // Step 2: Telegram sends my_chat_member when admin adds Bot A to private channel & promotes to admin
+  await sendUpdate(botA, {
+    update_id: 95003,
+    my_chat_member: {
+      chat: { id: -100999888777, type: 'channel', title: 'VIP Private Club' },
+      from: { id: 59001, first_name: 'Tenant' },
+      date: Math.floor(Date.now() / 1000),
+      old_chat_member: { user: { id: 8900001, is_bot: true }, status: 'left' },
+      new_chat_member: { user: { id: 8900001, is_bot: true }, status: 'administrator' },
+    },
+  });
+
+  const cfgLinked = await repos.botConfigs.getByBotId(botA.id);
+  assert.equal(cfgLinked.forceJoinChannels.length, 1);
+  assert.equal(cfgLinked.forceJoinChannels[0].chatId, '-100999888777');
+  assert.equal(cfgLinked.forceJoinChannels[0].inviteUrl, 'https://t.me/+VipSecret999');
+  assert.equal(cfgLinked.forceJoinChannels[0].isPrivate, true);
+  assert.equal(cfgLinked.forceJoinChannels[0].verified, true);
+  assert.equal(cfgLinked.templateSettings.pendingForceJoinLink, undefined);
+
+  // Step 3: Verify all 6 Telegram member statuses (creator/admin/member/restricted+is_member pass; restricted!is_member/left/kicked fail)
+  for (const passId of ['70001', '70002', '70003', '70004']) {
+    const check = await checkUserForceJoin({
+      telegram,
+      token: '8900001:AAH_TenantBotA_ValidToken_1234567890abcdef',
+      destinations: cfgLinked.forceJoinChannels,
+      userId: passId,
+    });
+    assert.equal(check.passed, true, `User ${passId} should pass Force Join`);
+  }
+  for (const failId of ['70005', '70006', '70007']) {
+    const check = await checkUserForceJoin({
+      telegram,
+      token: '8900001:AAH_TenantBotA_ValidToken_1234567890abcdef',
+      destinations: cfgLinked.forceJoinChannels,
+      userId: failId,
+    });
+    assert.equal(check.passed, false, `User ${failId} must be blocked by Force Join`);
+  }
+
+  // Step 4: Non-member (70006) messaging Bot A gets Join button with valid private invite URL (NOT @https://...)
+  const resBlocked = await sendUpdate(botA, {
+    update_id: 95004,
+    message: { chat: { id: 70006, type: 'private' }, from: { id: 70006, first_name: 'LeftUser' }, text: '/start' },
+  });
+  const blockedJson = await resBlocked.json();
+  assert.equal(blockedJson.forceJoinBlocked, true);
+  const gateCall = [...calls].reverse().find((c) => c.method === 'sendMessage' && c.body.chat_id === 70006);
+  const joinBtn = gateCall?.body?.reply_markup?.inline_keyboard?.[0]?.[0];
+  assert.equal(joinBtn?.url, 'https://t.me/+VipSecret999', 'Private Join button must use stored valid private invite URL');
+
+  // Step 5: Strict Tenant Isolation — same user (70006) on Bot B is NOT blocked by Bot A's Force Join!
+  const resBotB = await sendUpdate(botB, {
+    update_id: 95005,
+    message: { chat: { id: 70006, type: 'private' }, from: { id: 70006, first_name: 'LeftUser' }, text: '/start' },
+  });
+  const botBJson = await resBotB.json();
+  assert.notEqual(botBJson.forceJoinBlocked, true, 'Bot A Force Join config must never leak into Bot B');
+
+  // Step 6: Add second public channel + reverify + remove + clear
+  await sendUpdate(botA, {
+    update_id: 95006,
+    message: { chat: { id: 59001, type: 'private' }, from: { id: 59001, first_name: 'Tenant' }, text: '📣 Force Join' },
+  });
+  await sendUpdate(botA, {
+    update_id: 95007,
+    message: {
+      chat: { id: 59001, type: 'private' },
+      from: { id: 59001, first_name: 'Tenant' },
+      text: 'https://t.me/SecondPublicCh',
+    },
+  });
+  const cfgTwo = await repos.botConfigs.getByBotId(botA.id);
+  assert.equal(cfgTwo.forceJoinChannels.length, 2, 'Tenant must support multiple Force Join destinations');
+
+  const revRes = await reverifyForceJoinDestinations({
+    telegram,
+    token: '8900001:AAH_TenantBotA_ValidToken_1234567890abcdef',
+    destinations: cfgTwo.forceJoinChannels,
+  });
+  assert.equal(revRes.summary.every((s) => s.ok), true);
+
+  // Remove first destination
+  await sendUpdate(botA, {
+    update_id: 95008,
+    message: { chat: { id: 59001, type: 'private' }, from: { id: 59001, first_name: 'Tenant' }, text: '📣 Force Join' },
+  });
+  await sendUpdate(botA, {
+    update_id: 95009,
+    message: { chat: { id: 59001, type: 'private' }, from: { id: 59001, first_name: 'Tenant' }, text: 'remove 1' },
+  });
+  const cfgOne = await repos.botConfigs.getByBotId(botA.id);
+  assert.equal(cfgOne.forceJoinChannels.length, 1);
+  assert.equal(cfgOne.forceJoinChannels[0].username, 'SecondPublicCh');
+
+  // Clear all
+  await sendUpdate(botA, {
+    update_id: 95010,
+    message: { chat: { id: 59001, type: 'private' }, from: { id: 59001, first_name: 'Tenant' }, text: '📣 Force Join' },
+  });
+  await sendUpdate(botA, {
+    update_id: 95011,
+    message: { chat: { id: 59001, type: 'private' }, from: { id: 59001, first_name: 'Tenant' }, text: 'clear' },
+  });
+  const cfgCleared = await repos.botConfigs.getByBotId(botA.id);
+  assert.equal(cfgCleared.forceJoinChannels.length, 0);
+
+  // Join button builder sanity for public vs private
+  const kb = buildForceJoinGateKeyboard(cfgTwo.forceJoinChannels, 'fj:verify');
+  assert.equal(kb.inline_keyboard[0][0].url, 'https://t.me/+VipSecret999');
+  assert.equal(kb.inline_keyboard[1][0].url, 'https://t.me/SecondPublicCh');
+});
+
+// ============================================================================
+// 29. OWNER CONTROL CENTER — STRICT ACCESS CONTROL, PRIVATE FORCE JOIN & FIXES
+// ============================================================================
+test('Owner Control Center rejects unauthorized users, validates missing users, and supports Master Bot private Force Join linking', async () => {
+  const env = buildTestEnv();
+  const db = createDbClient(env.DB);
+  const repos = createRepositories(db, env);
+
+  const { fetchImpl, calls } = createMockTelegramFetch({
+    getChat: async ({ body }) => {
+      if (body.chat_id === '@MasterOfficial') {
+        return {
+          body: { ok: true, result: { id: -100777666555, type: 'channel', title: 'BOT FACTORY Official', username: 'MasterOfficial' } },
+        };
+      }
+      return { status: 400, body: { ok: false, error_code: 400, description: 'Bad Request: chat not found' } };
+    },
+    getChatMember: async () => ({ body: { ok: true, result: { status: 'administrator' } } }),
+  });
+
+  const postMaster = (update) =>
+    routeRequest(
+      new Request('https://bot-factory.example.workers.dev/webhook/master', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Telegram-Bot-Api-Secret-Token': env.MASTER_WEBHOOK_SECRET,
+        },
+        body: JSON.stringify(update),
+      }),
+      env,
+      {},
+      { fetchImpl }
+    );
+
+  // 1. Unauthorized normal user trying /owner and Owner ReplyKeyboard button is strictly rejected
+  await postMaster({
+    update_id: 96001,
+    message: { chat: { id: 333001, type: 'private' }, from: { id: 333001, first_name: 'Intruder' }, text: '/owner' },
+  });
+  await postMaster({
+    update_id: 96002,
+    message: {
+      chat: { id: 333001, type: 'private' },
+      from: { id: 333001, first_name: 'Intruder' },
+      text: OWNER_CONTROL_BUTTONS.MANAGE_USERS,
+    },
+  });
+  const intruderMsgs = calls.filter((c) => c.method === 'sendMessage' && c.body.chat_id === 333001);
+  assert.equal(intruderMsgs.length, 2);
+  assert.ok(intruderMsgs.every((m) => /Unauthorized|Restricted/i.test(m.body.text)));
+
+  // 2. Super Admin opens Manage Users, attempts plan update on non-existent user -> honest not-found error
+  const ownerId = Number(env.ADMIN_TELEGRAM_ID);
+  await postMaster({
+    update_id: 96003,
+    message: { chat: { id: ownerId, type: 'private' }, from: { id: ownerId, first_name: 'Owner' }, text: OWNER_CONTROL_BUTTONS.MANAGE_USERS },
+  });
+  await postMaster({
+    update_id: 96004,
+    message: { chat: { id: ownerId, type: 'private' }, from: { id: ownerId, first_name: 'Owner' }, text: 'plan 999999999 pro' },
+  });
+  const notFoundReply = [...calls].reverse().find((c) => c.method === 'sendMessage' && c.body.chat_id === ownerId);
+  assert.match(notFoundReply.body.text, /not found/i);
+
+  // 3. Stale wizard state is cleared when tapping another Owner section (CF Monitor)
+  await postMaster({
+    update_id: 96005,
+    message: { chat: { id: ownerId, type: 'private' }, from: { id: ownerId, first_name: 'Owner' }, text: OWNER_CONTROL_BUTTONS.CF_MONITOR },
+  });
+  const clearedWizard = await repos.users.getWizardState(String(ownerId));
+  assert.equal(clearedWizard, null, 'Switching to non-stateful Owner section must clear previous wizard state');
+
+  // 4. Master Bot private Force Join linking via my_chat_member
+  await postMaster({
+    update_id: 96006,
+    message: { chat: { id: ownerId, type: 'private' }, from: { id: ownerId, first_name: 'Owner' }, text: OWNER_CONTROL_BUTTONS.FORCE_JOIN },
+  });
+  await postMaster({
+    update_id: 96007,
+    message: {
+      chat: { id: ownerId, type: 'private' },
+      from: { id: ownerId, first_name: 'Owner' },
+      text: 'add https://t.me/+MasterPrivLink88',
+    },
+  });
+  await postMaster({
+    update_id: 96008,
+    my_chat_member: {
+      chat: { id: -100555444333, type: 'channel', title: 'BOT FACTORY Private VIP' },
+      from: { id: ownerId, first_name: 'Owner' },
+      date: Math.floor(Date.now() / 1000),
+      old_chat_member: { user: { id: 111111111, is_bot: true }, status: 'left' },
+      new_chat_member: { user: { id: 111111111, is_bot: true }, status: 'administrator' },
+    },
+  });
+
+  const settingsAfter = await repos.stats.getSettings();
+  const savedPlatformFj = JSON.parse(settingsAfter.map.platform_force_join_channels || '[]');
+  assert.equal(savedPlatformFj.length, 1);
+  assert.equal(savedPlatformFj[0].chatId, '-100555444333');
+  assert.equal(savedPlatformFj[0].inviteUrl, 'https://t.me/+MasterPrivLink88');
+  assert.equal(savedPlatformFj[0].verified, true);
+});
+
+// ============================================================================
+// 30. TELEGRAM SINGLE-MESSAGE ANIMATION ENGINE (ANTI-SPAM VERIFICATION)
+// ============================================================================
+test('Telegram animated progress helper updates a single message via editMessageText without spamming sendMessage', async () => {
+  const { fetchImpl, calls } = createMockTelegramFetch();
+  const telegram = createTelegramClient(fetchImpl);
+  const token = '8880001:AAH_AnimTest_ValidToken_1234567890abcdefg';
+
+  const { messageId, result } = await runAnimatedOperation({
+    telegram,
+    token,
+    chatId: 50001,
+    title: '⚡ Testing Progress Animation',
+    minStepIntervalMs: 10,
+    steps: [
+      { label: 'Step 1', doneLabel: 'Step 1 complete', run: async () => ({ a: 1 }) },
+      { label: 'Step 2', doneLabel: 'Step 2 complete', run: async (prev) => ({ ...prev, b: 2 }) },
+      { label: 'Step 3', doneLabel: 'Step 3 complete', run: async (prev) => ({ ...prev, c: 3 }) },
+    ],
+  });
+
+  assert.ok(messageId);
+  assert.deepEqual(result, { a: 1, b: 2, c: 3 });
+
+  const sends = calls.filter((c) => c.method === 'sendMessage');
+  const edits = calls.filter((c) => c.method === 'editMessageText');
+  assert.equal(sends.length, 1, 'Must send ONLY 1 initial progress message (zero chat spam)');
+  assert.equal(edits.length, 2, 'Subsequent steps must edit the exact same message_id');
+  assert.ok(edits.every((e) => e.body.message_id === messageId));
+});
+
 
 

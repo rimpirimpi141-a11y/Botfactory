@@ -180,7 +180,7 @@ export function formatErrorAnimationCard({ stageLabel, errorMessage }) {
 /**
  * Short transition loading message for statistics / config fetches (single edit, rate-limit friendly).
  */
-export async function withLoadingMessage({ telegram, token, chatId, loadingText, action }) {
+export async function withLoadingMessage({ telegram, token, chatId, loadingText, action, minDelayMs = 550 }) {
   await telegram.sendChatAction(token, chatId, 'typing').catch(() => {});
   const sent = await telegram.sendMessage(token, chatId, `⏳ <b>${escapeHtml(loadingText)}</b>`, {
     parse_mode: 'HTML',
@@ -191,8 +191,8 @@ export async function withLoadingMessage({ telegram, token, chatId, loadingText,
   try {
     const { text, replyMarkup } = await action();
     const elapsed = Date.now() - startedAt;
-    if (elapsed < 600) {
-      await sleep(600 - elapsed);
+    if (elapsed < minDelayMs) {
+      await sleep(minDelayMs - elapsed);
     }
     if (messageId) {
       await telegram.editMessageText(token, chatId, messageId, text, {
@@ -205,6 +205,7 @@ export async function withLoadingMessage({ telegram, token, chatId, loadingText,
         reply_markup: replyMarkup,
       });
     }
+    return { messageId };
   } catch (err) {
     const errText = `❌ <b>Operation Failed</b>\n\n${escapeHtml(err?.message || 'Unexpected error')}`;
     if (messageId) {
@@ -213,3 +214,61 @@ export async function withLoadingMessage({ telegram, token, chatId, loadingText,
     throw err;
   }
 }
+
+/**
+ * Lightweight single-message multi-step animation for Force Join verification,
+ * bot settings updates, and template operations. Never spams multiple messages;
+ * edits a single progress message with controlled 550-750ms spacing.
+ */
+export async function runAnimatedOperation({
+  telegram,
+  token,
+  chatId,
+  title,
+  steps = [],
+  minStepIntervalMs = 550,
+  finalReplyMarkup,
+  existingMessageId = null,
+}) {
+  await telegram.sendChatAction(token, chatId, 'typing').catch(() => {});
+
+  let messageId = existingMessageId;
+  const firstText = formatStageProgressMessage({
+    title,
+    stages: steps,
+    currentIndex: 0,
+    frameIndex: 0,
+  });
+
+  if (messageId) {
+    await telegram.editMessageText(token, chatId, messageId, firstText, { parse_mode: 'HTML' }).catch(() => {});
+  } else {
+    const sent = await telegram.sendMessage(token, chatId, firstText, { parse_mode: 'HTML' });
+    messageId = sent?.result?.message_id || null;
+  }
+
+  let finalResult = null;
+  for (let i = 0; i < steps.length; i++) {
+    const step = steps[i];
+    const startedAt = Date.now();
+
+    if (messageId && i > 0) {
+      const nextText = formatStageProgressMessage({
+        title,
+        stages: steps,
+        currentIndex: i,
+        frameIndex: i,
+      });
+      await telegram.editMessageText(token, chatId, messageId, nextText, { parse_mode: 'HTML' }).catch(() => {});
+    }
+
+    finalResult = await step.run(finalResult);
+    const elapsed = Date.now() - startedAt;
+    if (elapsed < minStepIntervalMs && i < steps.length - 1) {
+      await sleep(minStepIntervalMs - elapsed);
+    }
+  }
+
+  return { messageId, result: finalResult, finalReplyMarkup };
+}
+

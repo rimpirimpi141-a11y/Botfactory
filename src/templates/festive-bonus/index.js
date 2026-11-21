@@ -16,6 +16,7 @@ import { formatBrandedMessage } from '../../builder/theme-engine.js';
 import { buildReplyKeyboard, BUTTON_STYLES } from '../../utils/keyboards.js';
 import { escapeHtml } from '../../utils/validation.js';
 import { invalidateTenantCache } from '../../core/tenant-manager.js';
+import { checkUserForceJoin, formatDestinationLabel } from '../../core/force-join.js';
 import {
   ADMIN_COMMON_LABELS,
   buildCancelReplyKeyboard,
@@ -338,15 +339,17 @@ async function evaluateCampaignEligibilityAsync({ repos, telegram, token, bot, c
     reasons.push(`You have already reached the claim limit (${maxClaimsPerUser}).`);
   }
 
-  for (const ch of channels) {
-    try {
-      const m = await telegram.getChatMember(token, ch, endUser.telegram_id);
-      const status = m?.result?.status ?? m?.status;
-      if (!['member', 'administrator', 'creator'].includes(status)) {
-        reasons.push(`Please join required channel ${ch}.`);
+  if (channels.length > 0) {
+    const fjCheck = await checkUserForceJoin({
+      telegram,
+      token,
+      destinations: channels,
+      userId: endUser.telegram_id,
+    });
+    if (!fjCheck.passed) {
+      for (const missingDest of fjCheck.missing) {
+        reasons.push(`Please join required channel/group ${formatDestinationLabel(missingDest)}.`);
       }
-    } catch {
-      reasons.push(`Unable to verify membership in ${ch}. Ensure you joined the channel.`);
     }
   }
 

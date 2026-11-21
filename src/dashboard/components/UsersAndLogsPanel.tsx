@@ -194,7 +194,12 @@ export function UsersAndLogsPanel({
     setVerifyResult(null);
     try {
       const res = await api.verifyForceJoin(verifyChannelInput.trim());
-      if (res.botIsAdmin) {
+      if (res.pendingPrivateLink) {
+        setVerifyResult(
+          res.message ||
+            'Private invite link saved as pending. Add Master Bot to your private channel/group and promote it to Administrator to link its numeric chat ID.'
+        );
+      } else if (res.botIsAdmin) {
         setVerifyResult(`Verified: Master Bot is ${res.status} in ${res.channel}. Ready for Force Join.`);
       } else {
         setVerifyResult(`Not admin: Master Bot status in ${res.channel} is "${res.status}". Promote bot as Admin first.`);
