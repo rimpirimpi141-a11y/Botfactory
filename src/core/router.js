@@ -544,10 +544,127 @@ export async function routeRequest(request, env, ctx, { fetchImpl = globalThis.f
         );
       }
 
-      // Templates
+      // Templates (active list + full Studio management)
       if (method === 'GET' && path === '/api/templates') {
         const templates = await repos.templates.listActive();
         return jsonResponse({ ok: true, templates }, 200, env);
+      }
+
+      if (method === 'GET' && path === '/api/templates/all') {
+        const templates = await repos.templates.listAllForStudio();
+        return jsonResponse({ ok: true, templates }, 200, env);
+      }
+
+      const tplPatchMatch = path.match(/^\/api\/templates\/([^/]+)$/);
+      if (method === 'PATCH' && tplPatchMatch) {
+        const body = await request.json();
+        const updated = await repos.templates.updateTemplateAdmin(tplPatchMatch[1], {
+          availabilityStatus: body.availabilityStatus,
+          description: body.description,
+          name: body.name,
+        });
+        await writeSystemLog(env, {
+          level: 'audit',
+          source: 'api-templates',
+          message: `Updated template ${updated.slug} status=${updated.availability_status}`,
+          actorTelegramId: ownerId,
+        });
+        return jsonResponse({ ok: true, template: updated }, 200, env);
+      }
+
+      // Platform Referrals & Slot Entitlements Control
+      if (method === 'GET' && path === '/api/referrals') {
+        const referrals = await repos.platformReferrals.listAll({
+          status: url.searchParams.get('status') || '',
+          limit: Math.min(200, Number(url.searchParams.get('limit') || 100)),
+        });
+        return jsonResponse({ ok: true, referrals }, 200, env);
+      }
+
+      const refPatchMatch = path.match(/^\/api\/referrals\/([^/]+)$/);
+      if (method === 'PATCH' && refPatchMatch) {
+        const body = await request.json();
+        if (!['verified', 'rejected', 'pending', 'flagged'].includes(body?.status)) {
+          return jsonResponse({ ok: false, error: 'Status must be verified, rejected, flagged, or pending.' }, 400, env);
+        }
+        const updated = await repos.platformReferrals.updateStatus(refPatchMatch[1], {
+          status: body.status,
+          reviewedBy: ownerId,
+          reason: body.reason || '',
+        });
+        return jsonResponse({ ok: true, referral: updated }, 200, env);
+      }
+
+      // Platform Admins RBAC (Super Admin is immutable)
+      if (method === 'GET' && path === '/api/platform-admins') {
+        const admins = await repos.platformAdmins.list();
+        return jsonResponse(
+          { ok: true, superAdminTelegramId: env.ADMIN_TELEGRAM_ID || null, admins },
+          200,
+          env
+        );
+      }
+
+      if (method === 'POST' && path === '/api/platform-admins') {
+        const body = await request.json();
+        const admin = await repos.platformAdmins.upsert({
+          telegramId: body?.telegramId,
+          role: body?.role || 'admin',
+          permissions: body?.permissions,
+          addedBy: ownerId,
+        });
+        await writeSystemLog(env, {
+          level: 'audit',
+          source: 'api-admins',
+          message: `Added/updated platform admin ${admin.telegram_id}`,
+          actorTelegramId: ownerId,
+        });
+        return jsonResponse({ ok: true, admin }, 201, env);
+      }
+
+      const padmDelMatch = path.match(/^\/api\/platform-admins\/([^/]+)$/);
+      if (method === 'DELETE' && padmDelMatch) {
+        const res = await repos.platformAdmins.remove(padmDelMatch[1], ownerId);
+        await writeSystemLog(env, {
+          level: 'audit',
+          source: 'api-admins',
+          message: `Removed platform admin ${padmDelMatch[1]}`,
+          actorTelegramId: ownerId,
+        });
+        return jsonResponse({ ok: true, ...res }, 200, env);
+      }
+
+      // Recent Deployment Logs
+      if (method === 'GET' && path === '/api/deployments') {
+        const deployments = await repos.deployments.listRecent(Math.min(100, Number(url.searchParams.get('limit') || 50)));
+        return jsonResponse({ ok: true, deployments }, 200, env);
+      }
+
+      // Verify Master Bot Channel Membership / Admin Rights for Platform Force Join
+      if (method === 'POST' && path === '/api/force-join/verify') {
+        if (!env.MASTER_BOT_TOKEN) {
+          return jsonResponse({ ok: false, error: 'MASTER_BOT_TOKEN is not configured.' }, 400, env);
+        }
+        const body = await request.json();
+        const channel = String(body?.channel || '').trim();
+        if (!channel) return jsonResponse({ ok: false, error: 'channel is required.' }, 400, env);
+        const me = await telegram.getMe(env.MASTER_BOT_TOKEN);
+        const member = await telegram.getChatMember(env.MASTER_BOT_TOKEN, channel, me.result.id);
+        const status = member?.result?.status || 'unknown';
+        const isAdmin = ['administrator', 'creator'].includes(status);
+        return jsonResponse(
+          {
+            ok: true,
+            channel,
+            botUsername: me.result.username,
+            memberStatus: status,
+            status,
+            isAdmin,
+            botIsAdmin: isAdmin,
+          },
+          200,
+          env
+        );
       }
 
       // Validate Telegram Bot Token via real getMe
@@ -593,6 +710,7 @@ export async function routeRequest(request, env, ctx, { fetchImpl = globalThis.f
           description: body.description || '',
           branding: body.branding || {},
           customMenus: body.customMenus ? validateMenuTree(body.customMenus) : null,
+          templateConfig: body.templateConfig || null,
           onStage: async (stage, detail) => {
             stagesLog.push({ stage, detail, at: new Date().toISOString() });
           },
@@ -685,7 +803,7 @@ export async function routeRequest(request, env, ctx, { fetchImpl = globalThis.f
         }
       }
 
-      // Users Management
+      // Users Management (with plan, suspension, and bot slot override + audit log)
       if (method === 'GET' && path === '/api/users') {
         const users = await listUsers(repos, {
           query: url.searchParams.get('q') || '',
@@ -701,7 +819,8 @@ export async function routeRequest(request, env, ctx, { fetchImpl = globalThis.f
         if (method === 'GET') {
           const detail = await getUserProfileDetail(repos, targetId);
           if (!detail) return jsonResponse({ ok: false, error: 'User not found' }, 404, env);
-          return jsonResponse({ ok: true, ...detail }, 200, env);
+          const referrals = await repos.platformReferrals.listByReferrer(targetId, 25);
+          return jsonResponse({ ok: true, ...detail, referrals }, 200, env);
         }
         if (method === 'PATCH') {
           const body = await request.json();
@@ -711,6 +830,15 @@ export async function routeRequest(request, env, ctx, { fetchImpl = globalThis.f
           }
           if (typeof body.suspend === 'boolean') {
             updated = await setUserSuspension({ env, repos, telegramId: targetId, suspend: body.suspend, actorTelegramId: ownerId });
+          }
+          if (body.bonusBotSlots !== undefined && body.bonusBotSlots !== null) {
+            updated = await repos.users.adjustBotSlots(targetId, body.bonusBotSlots);
+            await writeSystemLog(env, {
+              level: 'audit',
+              source: 'api-users',
+              message: `Adjusted user ${targetId} bonus_bot_slots to ${body.bonusBotSlots}`,
+              actorTelegramId: ownerId,
+            });
           }
           return jsonResponse({ ok: true, user: updated }, 200, env);
         }
@@ -773,7 +901,7 @@ export async function routeRequest(request, env, ctx, { fetchImpl = globalThis.f
         }
       }
 
-      // Cloudflare Infrastructure Monitor
+      // Cloudflare Infrastructure Monitor (Two-Layer)
       if (method === 'GET' && path === '/api/cloudflare/metrics') {
         const metrics = await getCloudflareInfrastructureMetrics(env, repos, fetchImpl);
         return jsonResponse({ ok: true, metrics }, 200, env);

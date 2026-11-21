@@ -25,9 +25,12 @@ import {
   buildApprovalButtons,
   buildInlineKeyboard,
   buildMasterMainReplyKeyboard,
+  buildOwnerControlReplyKeyboard,
   buildReplyKeyboard,
   BUTTON_STYLES,
   inlineButton,
+  MASTER_MAIN_BUTTONS,
+  OWNER_CONTROL_BUTTONS,
 } from '../src/utils/keyboards.js';
 import { routeRequest } from '../src/core/router.js';
 import { createDbClient } from '../src/database/db.js';
@@ -37,6 +40,12 @@ import { deployTenantBot } from '../src/core/tenant-manager.js';
 import { createTelegramClient } from '../src/core/telegram-api.js';
 import { processBroadcastBatch, queueBroadcast } from '../src/admin/broadcast.js';
 import { validateMenuTree, createDefaultCustomMenuTree } from '../src/builder/menu-builder.js';
+import { generateDynamicAdminSpec } from '../src/builder/dynamic-admin.js';
+import { attributePlatformReferral, calculatePlanEntitlement } from '../src/core/plans-referrals.js';
+import { redeemCodeForUser } from '../src/templates/redeem-code/index.js';
+import { evaluateCampaignEligibility } from '../src/templates/festive-bonus/index.js';
+import { dispatchDueScheduledPosts } from '../src/templates/channel-automation/index.js';
+import { getCloudflareInfrastructureMetrics } from '../src/admin/cloudflare-monitor.js';
 import { redactString } from '../src/utils/logger.js';
 
 /**
@@ -46,8 +55,10 @@ function createTestD1() {
   const sqlite = new DatabaseSync(':memory:');
   const m1 = fs.readFileSync(path.resolve('migrations/0001_initial_schema.sql'), 'utf8');
   const m2 = fs.readFileSync(path.resolve('migrations/0002_seed_templates.sql'), 'utf8');
+  const m3 = fs.readFileSync(path.resolve('migrations/0003_platform_upgrade.sql'), 'utf8');
   sqlite.exec(m1);
   sqlite.exec(m2);
+  sqlite.exec(m3);
 
   function wrapStatement(sql, boundParams = []) {
     return {
@@ -252,13 +263,15 @@ test('Colourful keyboard factory preserves native Telegram style fields on Inlin
 // ============================================================================
 // 3. D1 SCHEMA MIGRATIONS & SEEDED TEMPLATES
 // ============================================================================
-test('D1 migrations create all required tables and seed all 7 prebuilt templates + custom builder', async () => {
+test('D1 migrations 0001-0003 create all required + upgrade tables and seed all Template Studio templates', async () => {
   const env = buildTestEnv();
   const db = createDbClient(env.DB);
   const health = await verifyDatabaseSchema(db);
   assert.equal(health.healthy, true);
+  assert.equal(health.upgrade0003Applied, true);
   assert.equal(health.missingTables.length, 0);
-  assert.equal(health.seededTemplates, 8);
+  assert.equal(health.missingUpgradeTables.length, 0);
+  assert.ok(health.seededTemplates >= 17, `Expected >= 17 seeded templates, got ${health.seededTemplates}`);
 });
 
 // ============================================================================
@@ -1020,3 +1033,699 @@ test('Incoming tenant webhook rejects missing, wrong, master, and cross-tenant s
   );
   assert.equal(validRes.status, 200);
 });
+
+// ============================================================================
+// 12. PLATFORM REFERRALS, ANTI-ABUSE & EXACT PLAN MILESTONES (0 / 8 / 48 / 50)
+// ============================================================================
+test('Platform referral attribution enforces anti-abuse rules and exact plan milestones (0, 5, 8, 48, 50)', async () => {
+  // Pure milestone calculation checks
+  const e0 = calculatePlanEntitlement({ plan: 'free', verified_referrals: 0, bonus_bot_slots: 0 }, 0);
+  assert.equal(e0.plan, 'free');
+  assert.equal(e0.maxBots, 2);
+
+  const e5 = calculatePlanEntitlement({ plan: 'free', verified_referrals: 5, bonus_bot_slots: 0 }, 0);
+  assert.equal(e5.plan, 'free');
+  assert.equal(e5.maxBots, 7);
+
+  const e8 = calculatePlanEntitlement({ plan: 'free', verified_referrals: 8, bonus_bot_slots: 0 }, 0);
+  assert.equal(e8.plan, 'starter');
+  assert.equal(e8.maxBots, 10);
+
+  const e48 = calculatePlanEntitlement({ plan: 'free', verified_referrals: 48, bonus_bot_slots: 0 }, 0);
+  assert.equal(e48.plan, 'pro');
+  assert.equal(e48.maxBots, 50);
+
+  const e50 = calculatePlanEntitlement({ plan: 'free', verified_referrals: 50, bonus_bot_slots: 0 }, 20);
+  assert.equal(e50.plan, 'enterprise');
+  assert.equal(e50.isUnlimited, true);
+  assert.equal(e50.maxBots, null);
+  assert.equal(e50.canCreateBot, true);
+
+  // Real D1 anti-abuse checks
+  const env = buildTestEnv();
+  const db = createDbClient(env.DB);
+  const repos = createRepositories(db, env);
+
+  const referrer = await repos.users.upsertFromTelegram({ id: 40001, username: 'creator_one', first_name: 'One' });
+  const invitee = await repos.users.upsertFromTelegram({ id: 40002, username: 'creator_two', first_name: 'Two' });
+
+  // Self-referral blocked
+  const selfAttempt = await attributePlatformReferral({
+    repos,
+    referrerCode: referrer.referral_code,
+    referredUser: { id: 40001, username: 'creator_one', is_bot: false },
+    isNewUser: true,
+  });
+  assert.equal(selfAttempt.attributed, false);
+  assert.match(selfAttempt.reason, /self/i);
+
+  // Bot account blocked
+  const botAttempt = await attributePlatformReferral({
+    repos,
+    referrerCode: referrer.referral_code,
+    referredUser: { id: 40099, username: 'fake_bot', is_bot: true },
+    isNewUser: true,
+  });
+  assert.equal(botAttempt.attributed, false);
+  assert.match(botAttempt.reason, /bot/i);
+
+  // Existing user (not new) blocked
+  const existingAttempt = await attributePlatformReferral({
+    repos,
+    referrerCode: referrer.referral_code,
+    referredUser: { id: 40002, username: 'creator_two', is_bot: false },
+    isNewUser: false,
+  });
+  assert.equal(existingAttempt.attributed, false);
+
+  // Legitimate new user attribution succeeds once
+  const validAttr = await attributePlatformReferral({
+    repos,
+    referrerCode: referrer.referral_code,
+    referredUser: { id: 40002, username: 'creator_two', is_bot: false },
+    isNewUser: true,
+  });
+  assert.equal(validAttr.attributed, true);
+
+  // Duplicate attribution blocked
+  const dupAttr = await attributePlatformReferral({
+    repos,
+    referrerCode: referrer.referral_code,
+    referredUser: { id: 40002, username: 'creator_two', is_bot: false },
+    isNewUser: true,
+  });
+  assert.equal(dupAttr.attributed, false);
+
+  const updatedReferrer = await repos.users.getByTelegramId('40001');
+  assert.equal(Number(updatedReferrer.verified_referrals), 1);
+  assert.equal(invitee.telegram_id, '40002');
+});
+
+// ============================================================================
+// 13. BACKEND BOT SLOT ENFORCEMENT (BLOCKS 3RD BOT ON 0-REF FREE ACCOUNT)
+// ============================================================================
+test('Backend enforces 2-bot FREE slot limit, unlocks 3rd slot after 1 verified referral, and never deletes existing bots on limit reduction', async () => {
+  const env = buildTestEnv();
+  const db = createDbClient(env.DB);
+  const repos = createRepositories(db, env);
+  const { fetchImpl } = createMockTelegramFetch();
+  const telegram = createTelegramClient(fetchImpl);
+
+  await repos.users.upsertFromTelegram({ id: 51001, username: 'slot_tester', first_name: 'Slot' });
+
+  // Bot 1 & Bot 2 succeed
+  await deployTenantBot({
+    env,
+    repos,
+    telegram,
+    ownerTelegramId: '51001',
+    rawToken: '7100001:AAH_SlotBotOne_ValidToken_1234567890abcdef',
+    templateId: 'tpl_tool_bot',
+    displayName: 'Slot Bot 1',
+  });
+  await deployTenantBot({
+    env,
+    repos,
+    telegram,
+    ownerTelegramId: '51001',
+    rawToken: '7100002:AAH_SlotBotTwo_ValidToken_1234567890abcdef',
+    templateId: 'tpl_apk_store',
+    displayName: 'Slot Bot 2',
+  });
+
+  // Bot 3 MUST be blocked by server-side slot enforcement
+  await assert.rejects(
+    () =>
+      deployTenantBot({
+        env,
+        repos,
+        telegram,
+        ownerTelegramId: '51001',
+        rawToken: '7100003:AAH_SlotBotThree_ValidToken_1234567890abcd',
+        templateId: 'tpl_task_bot',
+        displayName: 'Slot Bot 3',
+      }),
+    /slot limit reached/i
+  );
+
+  // Grant +1 verified referral -> now 3 slots available -> Bot 3 succeeds!
+  const creator = await repos.users.getByTelegramId('51001');
+  await repos.users.upsertFromTelegram({ id: 51002, username: 'ref_friend', first_name: 'Friend' });
+  await attributePlatformReferral({
+    repos,
+    referrerCode: creator.referral_code,
+    referredUser: { id: 51002, username: 'ref_friend', is_bot: false },
+    isNewUser: true,
+  });
+
+  const bot3 = await deployTenantBot({
+    env,
+    repos,
+    telegram,
+    ownerTelegramId: '51001',
+    rawToken: '7100003:AAH_SlotBotThree_ValidToken_1234567890abcd',
+    templateId: 'tpl_task_bot',
+    displayName: 'Slot Bot 3',
+  });
+  assert.equal(bot3.bot.status, 'active');
+
+  // Owner reduces bonus slots to -2 -> existing 3 bots are NEVER deleted, only new creation is blocked
+  await repos.users.adjustBotSlots('51001', -2);
+  const existing = await repos.bots.listByOwner('51001');
+  assert.equal(existing.length, 3);
+});
+
+// ============================================================================
+// 14. MASTER BOT 9-BUTTON COLOURFUL REPLY KEYBOARD & OWNER 12-SECTION RBAC
+// ============================================================================
+test('Master Bot renders exact 9 colourful native ReplyKeyboard buttons with zero unstyled buttons and Owner Control Center enforces RBAC', async () => {
+  const userKb = buildMasterMainReplyKeyboard(false);
+  const userButtons = userKb.keyboard.flat();
+  assert.equal(userButtons.length, 9);
+  for (const btn of userButtons) {
+    assert.ok(['success', 'primary', 'danger'].includes(btn.style), `Button "${btn.text}" must have colourful style`);
+  }
+
+  const ownerKb = buildOwnerControlReplyKeyboard();
+  const ownerButtons = ownerKb.keyboard.flat();
+  assert.equal(ownerButtons.length, Object.keys(OWNER_CONTROL_BUTTONS).length);
+  for (const btn of ownerButtons) {
+    assert.ok(['success', 'primary', 'danger'].includes(btn.style), `Owner button "${btn.text}" must have colourful style`);
+  }
+
+  // Verify Master Bot /start sends single welcome with ReplyKeyboard (no duplicate inline main menu)
+  const workerUrl = 'https://botfactory.rimpirimpi141.workers.dev';
+  const env = buildTestEnv({ WORKER_PUBLIC_URL: workerUrl });
+  const { fetchImpl, calls } = createMockTelegramFetch();
+
+  const startRes = await routeRequest(
+    new Request(`${workerUrl}/webhook/master`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Telegram-Bot-Api-Secret-Token': env.MASTER_WEBHOOK_SECRET,
+      },
+      body: JSON.stringify({
+        update_id: 5001,
+        message: { chat: { id: 88001, type: 'private' }, from: { id: 88001, first_name: 'Nova' }, text: '/start' },
+      }),
+    }),
+    env,
+    {},
+    { fetchImpl }
+  );
+  assert.equal(startRes.status, 200);
+  const sent = calls.filter((c) => c.method === 'sendMessage' && c.body.chat_id === 88001);
+  assert.equal(sent.length, 1, 'Master Bot /start must send a single welcome message with ReplyKeyboard');
+  assert.ok(Array.isArray(sent[0].body.reply_markup.keyboard));
+  assert.equal(sent[0].body.reply_markup.inline_keyboard, undefined);
+
+  // Verify Super Admin protection in platform_admins repo
+  const db = createDbClient(env.DB);
+  const repos = createRepositories(db, env);
+  await repos.platformAdmins.add({ telegramId: '88002', username: 'mod_user', addedBy: env.ADMIN_TELEGRAM_ID });
+  const admins = await repos.platformAdmins.list();
+  assert.equal(admins.length, 1);
+
+  // Ordinary admin / anyone cannot remove Super Admin
+  await assert.rejects(
+    () => repos.platformAdmins.remove(env.ADMIN_TELEGRAM_ID, env.ADMIN_TELEGRAM_ID),
+    /super admin/i
+  );
+});
+
+// ============================================================================
+// 15. TEMPLATE STUDIO COMING SOON ENFORCEMENT
+// ============================================================================
+test('Template Studio exposes 11 functional templates + 2 Coming Soon templates and strictly blocks Coming Soon deployment', async () => {
+  const env = buildTestEnv();
+  const db = createDbClient(env.DB);
+  const repos = createRepositories(db, env);
+  const { fetchImpl } = createMockTelegramFetch();
+  const telegram = createTelegramClient(fetchImpl);
+
+  const all = await repos.templates.listAllForStudio();
+  const hosting = all.find((t) => t.slug === 'hosting-bot');
+  const cloner = all.find((t) => t.slug === 'own-bot-cloner');
+  assert.ok(hosting && Number(hosting.is_coming_soon) === 1);
+  assert.ok(cloner && Number(cloner.is_coming_soon) === 1);
+
+  for (const slug of ['hosting-bot', 'own-bot-cloner']) {
+    await assert.rejects(
+      () =>
+        deployTenantBot({
+          env,
+          repos,
+          telegram,
+          ownerTelegramId: '52001',
+          rawToken: '7200001:AAH_ComingSoonTest_ValidToken_1234567890ab',
+          templateId: slug,
+          displayName: 'Should Fail',
+        }),
+      /coming soon/i
+    );
+  }
+});
+
+// ============================================================================
+// 16. ATOMIC PAYMENT PROOF APPROVAL & TASK BOT NO AUTO-CREDIT
+// ============================================================================
+test('Payment proof approval is strictly atomic (blocks double approval) and Task Bot never auto-credits on screenshot upload', async () => {
+  const env = buildTestEnv();
+  const db = createDbClient(env.DB);
+  const repos = createRepositories(db, env);
+  const { fetchImpl } = createMockTelegramFetch();
+  const telegram = createTelegramClient(fetchImpl);
+
+  const deployed = await deployTenantBot({
+    env,
+    repos,
+    telegram,
+    ownerTelegramId: '53001',
+    rawToken: '7300001:AAH_TaskAndPayBot_ValidToken_1234567890abc',
+    templateId: 'tpl_task_bot',
+    displayName: 'Task Verification Bot',
+  });
+
+  await repos.endUsers.upsert(deployed.bot.id, { id: 91001, first_name: 'WorkerUser' });
+
+  // 1. Payment proof atomic approval prevents double delivery
+  const proof = await repos.payments.createProof({
+    botId: deployed.bot.id,
+    endUserId: '91001',
+    referenceType: 'product_order',
+    referenceId: 'ord_1',
+    amount: 199,
+    utrNumber: 'UTR9988776655',
+    proofFileId: 'AgACAgIAAxkBA_test_screenshot',
+  });
+  const firstApprove = await repos.payments.approveProof(deployed.bot.id, proof.id, '53001');
+  assert.equal(firstApprove.approved, true);
+  const secondApprove = await repos.payments.approveProof(deployed.bot.id, proof.id, '53001');
+  assert.equal(secondApprove.approved, false);
+
+  // 2. Task submission stays pending with 0 balance until explicit admin approval
+  await db.run(
+    `INSERT INTO tasks (id, bot_id, title, description, reward_amount, max_submissions, submission_count, is_active, created_by, created_at)
+     VALUES ('task_001', ?, 'Follow Official Channel', 'Upload screenshot proof', 40, 10, 0, 1, '53001', datetime('now'))`,
+    [deployed.bot.id]
+  );
+  await db.run(
+    `INSERT INTO task_submissions (id, bot_id, task_id, user_telegram_id, screenshot_file_id, reward_amount, status, created_at)
+     VALUES ('sub_001', ?, 'task_001', '91001', 'AgAC_proof_1', 40, 'pending', datetime('now'))`,
+    [deployed.bot.id]
+  );
+
+  // Balance MUST still be 0 after screenshot submission!
+  const beforeBalance = await repos.endUsers.get(deployed.bot.id, '91001');
+  assert.equal(Number(beforeBalance.points_balance), 0);
+
+  // Admin approves via real webhook callback -> balance credits atomically once
+  const workerUrl = 'https://botfactory.rimpirimpi141.workers.dev';
+  const approveReq = () =>
+    routeRequest(
+      new Request(`${workerUrl}/webhook/${deployed.bot.id}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Telegram-Bot-Api-Secret-Token': deployed.bot.webhook_secret,
+        },
+        body: JSON.stringify({
+          update_id: Math.floor(Math.random() * 100000) + 100,
+          callback_query: {
+            id: 'cb_task_approve',
+            from: { id: 53001, first_name: 'Owner' },
+            message: { chat: { id: 53001, type: 'private' }, message_id: 77 },
+            data: 'tb:adm_approve:sub_001',
+          },
+        }),
+      }),
+      env,
+      {},
+      { fetchImpl }
+    );
+
+  const r1 = await approveReq();
+  assert.equal(r1.status, 200);
+  const afterFirst = await repos.endUsers.get(deployed.bot.id, '91001');
+  assert.equal(Number(afterFirst.points_balance), 40);
+
+  // Duplicate tap must NOT credit again
+  const r2 = await approveReq();
+  assert.equal(r2.status, 200);
+  const afterSecond = await repos.endUsers.get(deployed.bot.id, '91001');
+  assert.equal(Number(afterSecond.points_balance), 40);
+});
+
+// ============================================================================
+// 17. REDEEM CODE BOT & FESTIVE BONUS ELIGIBILITY RULES
+// ============================================================================
+test('Redeem Code Bot enforces min_referrals, max claims, expiry, and duplicate prevention; Festive Bonus enforces date window & referrals', async () => {
+  const env = buildTestEnv();
+  const db = createDbClient(env.DB);
+  const repos = createRepositories(db, env);
+  const { fetchImpl } = createMockTelegramFetch();
+  const telegram = createTelegramClient(fetchImpl);
+
+  const deployed = await deployTenantBot({
+    env,
+    repos,
+    telegram,
+    ownerTelegramId: '54001',
+    rawToken: '7400001:AAH_RedeemCodeBot_ValidToken_1234567890abc',
+    templateId: 'tpl_redeem_code',
+    displayName: 'Redeem Vault Bot',
+  });
+
+  await repos.endUsers.upsert(deployed.bot.id, { id: 92001, first_name: 'Claimer' });
+  await db.run(
+    `INSERT INTO giftcodes (id, bot_id, code, reward_points, max_uses, used_count, min_referrals, expires_at, status, created_by, created_at)
+     VALUES ('gc_ref', ?, 'REFONLY50', 50, 1, 0, 2, '2099-01-01T00:00:00Z', 'active', '54001', datetime('now'))`,
+    [deployed.bot.id]
+  );
+
+  // Fails when user has 0 referrals (< 2 required)
+  const denied = await redeemCodeForUser({ db, repos, botId: deployed.bot.id, endUserId: '92001', code: 'REFONLY50' });
+  assert.equal(denied.ok, false);
+  assert.match(denied.reason, /referral/i);
+
+  // Grant 2 referrals -> redemption succeeds once, duplicate blocked
+  await db.run(`UPDATE bot_end_users SET referral_count = 2 WHERE bot_id = ? AND telegram_id = '92001'`, [
+    deployed.bot.id,
+  ]);
+  const allowed = await redeemCodeForUser({ db, repos, botId: deployed.bot.id, endUserId: '92001', code: 'REFONLY50' });
+  assert.equal(allowed.ok, true);
+  assert.equal(allowed.reward, 50);
+
+  const dup = await redeemCodeForUser({ db, repos, botId: deployed.bot.id, endUserId: '92001', code: 'REFONLY50' });
+  assert.equal(dup.ok, false);
+
+  // Festive Bonus eligibility rules
+  const now = new Date('2026-10-20T12:00:00Z');
+  const ended = evaluateCampaignEligibility({
+    campaign: { startDate: '2026-10-01T00:00:00Z', endDate: '2026-10-15T00:00:00Z', minReferrals: 0, maxClaims: 100 },
+    userReferralCount: 5,
+    totalClaims: 10,
+    alreadyClaimed: false,
+    now,
+  });
+  assert.equal(ended.eligible, false);
+  assert.match(ended.reason, /ended/i);
+
+  const okFestive = evaluateCampaignEligibility({
+    campaign: { startDate: '2026-10-01T00:00:00Z', endDate: '2026-10-30T00:00:00Z', minReferrals: 2, maxClaims: 100 },
+    userReferralCount: 3,
+    totalClaims: 10,
+    alreadyClaimed: false,
+    now,
+  });
+  assert.equal(okFestive.eligible, true);
+});
+
+// ============================================================================
+// 18. CHANNEL AUTOMATION ADMIN VERIFICATION & CRON DISPATCHER
+// ============================================================================
+test('Channel Automation verifies real bot admin permission via getChatMember and dispatches scheduled posts via cron', async () => {
+  const env = buildTestEnv();
+  const db = createDbClient(env.DB);
+  const repos = createRepositories(db, env);
+  const { fetchImpl, calls } = createMockTelegramFetch({
+    getChatMember: async ({ body }) => ({
+      status: 200,
+      body: { ok: true, result: { status: body.chat_id === '@AdminChannel' ? 'administrator' : 'member' } },
+    }),
+  });
+  const telegram = createTelegramClient(fetchImpl);
+
+  const deployed = await deployTenantBot({
+    env,
+    repos,
+    telegram,
+    ownerTelegramId: '55001',
+    rawToken: '7500001:AAH_ChannelAutoBot_ValidToken_1234567890ab',
+    templateId: 'tpl_channel_automation',
+    displayName: 'Channel Scheduler Bot',
+  });
+
+  // Insert connected channel & due scheduled post
+  await db.run(
+    `INSERT INTO connected_channels (id, bot_id, channel_id, channel_title, verified_admin, connected_by, created_at)
+     VALUES ('ch_1', ?, '@AdminChannel', 'Official Channel', 1, '55001', datetime('now'))`,
+    [deployed.bot.id]
+  );
+  await db.run(
+    `INSERT INTO scheduled_posts (id, bot_id, channel_id, post_text, scheduled_for, status, created_by, created_at)
+     VALUES ('post_1', ?, '@AdminChannel', 'Scheduled launch announcement!', '2020-01-01T00:00:00.000Z', 'scheduled', '55001', datetime('now'))`,
+    [deployed.bot.id]
+  );
+
+  const dispatchRes = await dispatchDueScheduledPosts({ env, db, repos, telegram });
+  assert.equal(dispatchRes.sent, 1);
+  const channelCall = calls.find((c) => c.method === 'sendMessage' && c.body.chat_id === '@AdminChannel');
+  assert.ok(channelCall, 'Scheduled post must be sent to @AdminChannel');
+
+  const { row: postRow } = await db.first(`SELECT status FROM scheduled_posts WHERE id = 'post_1'`);
+  assert.equal(postRow.status, 'sent');
+});
+
+// ============================================================================
+// 19. CUSTOM BUILDER DYNAMIC ADMIN GENERATOR & TWO-LAYER CLOUDFLARE MONITOR
+// ============================================================================
+test('Custom Builder dynamically generates matching Admin Panel modules and Cloudflare Monitor cleanly separates Layer 1 vs Layer 2', async () => {
+  const menus = [
+    {
+      menuKey: 'main',
+      title: 'Storefront',
+      messageText: 'Welcome',
+      buttons: [
+        { id: 'b1', label: 'Shop', emoji: '🛍', actionType: 'feature', actionPayload: 'catalogue:all', style: 'success' },
+        { id: 'b2', label: 'Order', emoji: '📦', actionType: 'feature', actionPayload: 'create_order:all', style: 'primary' },
+        { id: 'b3', label: 'Apply', emoji: '📝', actionType: 'feature', actionPayload: 'form:Send email', style: 'primary' },
+        { id: 'b4', label: 'Help', emoji: '🆘', actionType: 'support', actionPayload: 'Support', style: 'primary' },
+      ],
+    },
+  ];
+
+  const dynamicSpec = generateDynamicAdminSpec(menus);
+  const labels = dynamicSpec.replyKeyboard.keyboard.flat().map((b) => b.text);
+  assert.ok(labels.includes('🛍 Manage Products'));
+  assert.ok(labels.includes('📦 Manage Orders'));
+  assert.ok(labels.includes('💳 Payment Verification'));
+  assert.ok(labels.includes('📥 Form Submissions'));
+  assert.ok(labels.includes('🆘 Support Settings'));
+  for (const btn of dynamicSpec.replyKeyboard.keyboard.flat()) {
+    assert.ok(['success', 'primary', 'danger'].includes(btn.style));
+  }
+
+  // Two-Layer Cloudflare Monitor without CLOUDFLARE_API_TOKEN/CLOUDFLARE_ACCOUNT_ID
+  const env = buildTestEnv();
+  const db = createDbClient(env.DB);
+  const repos = createRepositories(db, env);
+  const cf = await getCloudflareInfrastructureMetrics(env, repos);
+  assert.equal(cf.applicationHealth.status, 'healthy');
+  assert.equal(cf.applicationHealth.d1.healthy, true);
+  assert.equal(cf.applicationHealth.kv.healthy, true);
+  assert.equal(cf.accountMetrics.configured, false);
+  assert.equal(cf.accountMetrics.message, 'Account-level metrics are not configured.');
+});
+
+// ============================================================================
+// 20. MASTER BOT 9-BUTTON HANDLERS END-TO-END
+// ============================================================================
+test('Master Bot handles Template Studio, My Statistics, Plans & Features, Account Settings, and Help & Support cleanly', async () => {
+  const workerUrl = 'https://botfactory.rimpirimpi141.workers.dev';
+  const env = buildTestEnv({ WORKER_PUBLIC_URL: workerUrl, MASTER_BOT_USERNAME: 'BotFactoryMasterBot' });
+  const { fetchImpl, calls } = createMockTelegramFetch();
+
+  let updateId = 8000;
+  const sendMasterText = async (text) => {
+    updateId += 1;
+    const res = await routeRequest(
+      new Request(`${workerUrl}/webhook/master`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Telegram-Bot-Api-Secret-Token': env.MASTER_WEBHOOK_SECRET,
+        },
+        body: JSON.stringify({
+          update_id: updateId,
+          message: { chat: { id: 94001, type: 'private' }, from: { id: 94001, username: 'builder94', first_name: 'Aria' }, text },
+        }),
+      }),
+      env,
+      {},
+      { fetchImpl }
+    );
+    assert.equal(res.status, 200);
+  };
+
+  await sendMasterText('/start');
+  await sendMasterText('🧩 Template Studio');
+  await sendMasterText('📊 My Statistics');
+  await sendMasterText('💎 Plans & Features');
+  await sendMasterText('⚙️ Account Settings');
+  await sendMasterText('📣 Help & Support');
+
+  const messages = calls
+    .filter((c) => (c.method === 'sendMessage' || c.method === 'editMessageText') && c.body.chat_id === 94001)
+    .map((c) => c.body.text);
+  assert.ok(messages.some((m) => /Template Studio/i.test(m) && /COMING SOON/i.test(m)), 'Template Studio must list Coming Soon items');
+  assert.ok(messages.some((m) => /Statistics/i.test(m)), 'My Statistics must render');
+  assert.ok(
+    messages.some((m) => /Plans &amp; Referral|Plans & Referral/i.test(m) && /https:\/\/t\.me\/BotFactoryMasterBot\?start=/i.test(m)),
+    'Plans & Features must show personal referral link'
+  );
+  assert.ok(messages.some((m) => /Account Settings/i.test(m)), 'Account Settings must render');
+  assert.ok(messages.some((m) => /Help &amp; Support|Help & Support/i.test(m)), 'Help & Support must render');
+});
+
+// ============================================================================
+// 21. REFER & EARN ADMIN + TENANT ADMIN USER LIST + SMM DEPOSIT + FESTIVE CLAIM + SECRETARY MODE
+// ============================================================================
+test('Tenant templates execute real D1 transactions cleanly (Refer & Earn, Tenant Admin Users, SMM Deposit, Festive Bonus, Channel Secretary Mode)', async () => {
+  const workerUrl = 'https://botfactory.rimpirimpi141.workers.dev';
+  const env = buildTestEnv({ WORKER_PUBLIC_URL: workerUrl });
+  const db = createDbClient(env.DB);
+  const repos = createRepositories(db, env);
+  const { fetchImpl, calls } = createMockTelegramFetch();
+  const telegram = createTelegramClient(fetchImpl);
+
+  // Give owner 58001 bonus slots so we can deploy 4 template bots in one test
+  await repos.users.upsertFromTelegram({ id: 58001, username: 'multi_owner', first_name: 'Multi' });
+  await repos.users.adjustBotSlots('58001', 10);
+
+  const sendTenantUpdate = async (bot, payload) => {
+    const res = await routeRequest(
+      new Request(`${workerUrl}/webhook/${bot.id}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Telegram-Bot-Api-Secret-Token': bot.webhook_secret,
+        },
+        body: JSON.stringify(payload),
+      }),
+      env,
+      {},
+      { fetchImpl }
+    );
+    assert.equal(res.status, 200);
+  };
+
+  // A. Refer & Earn + Tenant Admin 👥 User List (verifies joined_at fix & admin giftcode creation)
+  const reBot = (
+    await deployTenantBot({
+      env,
+      repos,
+      telegram,
+      ownerTelegramId: '58001',
+      rawToken: '7800001:AAH_ReferEarnTest_ValidToken_1234567890ab',
+      templateId: 'tpl_refer_earn',
+      displayName: 'RE Test Bot',
+    })
+  ).bot;
+
+  await sendTenantUpdate(reBot, {
+    update_id: 9001,
+    message: { chat: { id: 58001, type: 'private' }, from: { id: 58001, first_name: 'Multi' }, text: '👥 User List' },
+  });
+  await sendTenantUpdate(reBot, {
+    update_id: 9002,
+    message: { chat: { id: 58001, type: 'private' }, from: { id: 58001, first_name: 'Multi' }, text: '🎟 Create Giftcode' },
+  });
+  await sendTenantUpdate(reBot, {
+    update_id: 9003,
+    message: { chat: { id: 58001, type: 'private' }, from: { id: 58001, first_name: 'Multi' }, text: 'BONUS25 | 25 | 5 | 14' },
+  });
+  const { row: createdGc } = await db.first(`SELECT code, reward_points FROM giftcodes WHERE bot_id = ? AND code = 'BONUS25'`, [reBot.id]);
+  assert.equal(createdGc?.code, 'BONUS25');
+  assert.equal(Number(createdGc?.reward_points), 25);
+
+  // B. SMM Panel deposit proof approval (verifies tx_type = 'admin_credit' satisfies CHECK constraint)
+  const smmBot = (
+    await deployTenantBot({
+      env,
+      repos,
+      telegram,
+      ownerTelegramId: '58001',
+      rawToken: '7800002:AAH_SmmPanelTest_ValidToken_1234567890abc',
+      templateId: 'tpl_smm_panel',
+      displayName: 'SMM Test Bot',
+    })
+  ).bot;
+  await repos.endUsers.upsert(smmBot.id, { id: 95001, first_name: 'Buyer' });
+  const smmProof = await repos.payments.createProof({
+    botId: smmBot.id,
+    userTelegramId: '95001',
+    orderType: 'smm_deposit',
+    referenceId: 'dep_1',
+    amount: 250,
+    utrNumber: 'UTR555444333',
+  });
+  await sendTenantUpdate(smmBot, {
+    update_id: 9010,
+    callback_query: {
+      id: 'cb_smm_dep',
+      from: { id: 58001, first_name: 'Multi' },
+      message: { chat: { id: 58001, type: 'private' }, message_id: 12 },
+      data: `smm:dep:approve:${smmProof.id}`,
+    },
+  });
+  const buyerAfterSmm = await repos.endUsers.get(smmBot.id, '95001');
+  assert.equal(Number(buyerAfterSmm.points_balance), 250);
+
+  // C. Festive Bonus claim + max claims enforcement (verifies tx_type = 'reward' + reference_id = 'festive_bonus')
+  const festBot = (
+    await deployTenantBot({
+      env,
+      repos,
+      telegram,
+      ownerTelegramId: '58001',
+      rawToken: '7800003:AAH_FestiveTest_ValidToken_1234567890abcd',
+      templateId: 'tpl_festive_bonus',
+      displayName: 'Diwali Bonus Bot',
+      templateConfig: { campaignName: 'Diwali 2026', rewardAmount: 75, minReferrals: 0, maxClaimsPerUser: 1 },
+    })
+  ).bot;
+  await sendTenantUpdate(festBot, {
+    update_id: 9020,
+    message: { chat: { id: 96001, type: 'private' }, from: { id: 96001, first_name: 'FestUser' }, text: '🎁 Claim Festive Bonus' },
+  });
+  await sendTenantUpdate(festBot, {
+    update_id: 9021,
+    message: { chat: { id: 96001, type: 'private' }, from: { id: 96001, first_name: 'FestUser' }, text: '🎁 Claim Festive Bonus' },
+  });
+  const festUser = await repos.endUsers.get(festBot.id, '96001');
+  assert.equal(Number(festUser.points_balance), 75, 'Second festive claim must be blocked by maxClaimsPerUser = 1');
+
+  // D. Channel Automation Secretary Mode forwarding
+  const chBot = (
+    await deployTenantBot({
+      env,
+      repos,
+      telegram,
+      ownerTelegramId: '58001',
+      rawToken: '7800004:AAH_ChannelSecTest_ValidToken_1234567890a',
+      templateId: 'tpl_channel_automation',
+      displayName: 'Channel Sec Bot',
+    })
+  ).bot;
+  await db.run(
+    `INSERT INTO connected_channels (id, bot_id, channel_id, channel_title, verified_admin, connected_by, created_at)
+     VALUES ('ch_sec', ?, '@SecretaryChannel', 'Sec Channel', 1, '58001', datetime('now'))`,
+    [chBot.id]
+  );
+  await sendTenantUpdate(chBot, {
+    update_id: 9030,
+    message: { chat: { id: 58001, type: 'private' }, from: { id: 58001, first_name: 'Multi' }, text: '🤖 Toggle Secretary Mode' },
+  });
+  await sendTenantUpdate(chBot, {
+    update_id: 9031,
+    message: { chat: { id: 58001, type: 'private' }, from: { id: 58001, first_name: 'Multi' }, text: 'Breaking update from Secretary Mode!' },
+  });
+  const forwarded = calls.find(
+    (c) => c.method === 'sendMessage' && c.body.chat_id === '@SecretaryChannel' && /Secretary Mode/.test(c.body.text)
+  );
+  assert.ok(forwarded, 'Secretary Mode must forward admin message directly to verified connected channel');
+});
+
+

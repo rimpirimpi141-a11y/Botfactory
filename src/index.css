@@ -44,3 +44,73 @@
 ::-webkit-scrollbar-thumb:hover {
   background: #334155;
 }
+
+/* Smooth compositor-only dashboard transitions & loading skeletons */
+@keyframes bf-fade-slide-up {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes bf-modal-pop {
+  from {
+    opacity: 0;
+    transform: scale(0.97) translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
+}
+
+@keyframes bf-bar-grow {
+  from {
+    transform: scaleY(0);
+  }
+  to {
+    transform: scaleY(1);
+  }
+}
+
+@keyframes bf-shimmer {
+  0% {
+    background-position: -200% 0;
+  }
+  100% {
+    background-position: 200% 0;
+  }
+}
+
+.animate-fade-slide-up {
+  animation: bf-fade-slide-up 240ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.animate-modal-pop {
+  animation: bf-modal-pop 200ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.animate-bar-grow {
+  transform-origin: bottom;
+  animation: bf-bar-grow 420ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.bf-skeleton {
+  background: linear-gradient(90deg, #131c31 25%, #1e293b 50%, #131c31 75%);
+  background-size: 200% 100%;
+  animation: bf-shimmer 1.4s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-fade-slide-up,
+  .animate-modal-pop,
+  .animate-bar-grow,
+  .bf-skeleton {
+    animation: none;
+  }
+}
+

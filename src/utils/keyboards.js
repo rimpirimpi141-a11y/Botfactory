@@ -22,6 +22,41 @@ export const BUTTON_STYLES = Object.freeze({
 const VALID_TELEGRAM_STYLES = new Set(['success', 'primary', 'danger']);
 
 /**
+ * Exact 9 User Panel buttons for the Master Bot native ReplyKeyboard.
+ */
+export const MASTER_MAIN_BUTTONS = Object.freeze({
+  CREATE_BOT: '🤖 Create New Bot',
+  MY_BOTS: '📂 My Created Bots',
+  TEMPLATE_STUDIO: '🧩 Template Studio',
+  CUSTOM_BUILDER: '🛠️ Custom Bot Builder',
+  MY_STATS: '📊 My Statistics',
+  PLANS_FEATURES: '💎 Plans & Features',
+  ACCOUNT_SETTINGS: '⚙️ Account Settings',
+  ADD_SUPPORT: '📢 Add Support',
+  HELP_SUPPORT: '📣 Help & Support',
+  OWNER_CENTER: '👑 Owner Control Center',
+});
+
+/**
+ * Exact 12 Owner Control Center native ReplyKeyboard sections.
+ */
+export const OWNER_CONTROL_BUTTONS = Object.freeze({
+  OVERVIEW: '📊 Platform Overview',
+  MANAGE_USERS: '👥 Manage Users',
+  ALL_BOTS: '🤖 All Created Bots',
+  TEMPLATE_MGMT: '🧩 Template Management',
+  BROADCAST_CENTER: '📢 Broadcast Center',
+  FORCE_JOIN: '📣 Force Join Settings',
+  SUPPORT_MGMT: '🆘 Support Management',
+  PLANS_REFERRALS: '💎 Plans & Referral Control',
+  ADMIN_MGMT: '👮 Admin Management',
+  CF_MONITOR: '☁️ Cloudflare Monitor',
+  ACTIVITY_LOGS: '📋 Activity Logs',
+  PLATFORM_SETTINGS: '⚙️ Platform Settings',
+  EXIT_OWNER: '⬅️ Exit Owner Center',
+});
+
+/**
  * Normalizes a requested style into a valid Telegram Bot API `style` value
  * or returns undefined for standard buttons. Never outputs arbitrary HEX strings.
  */
@@ -139,59 +174,108 @@ export function buildConfirmCancelKeyboard(confirmCallback, cancelCallback, conf
 }
 
 /**
- * Master Bot Main Reply Keyboard (Colourful native Telegram buttons).
+ * Master Bot Main Native ReplyKeyboard — Exact 9 Vibrant User Buttons (+ Owner Control Center for Admins).
+ * Zero unstyled/hollow buttons; every button carries an explicit native Telegram colour style.
  */
 export function buildMasterMainReplyKeyboard(isOwner = false) {
   const rows = [
     [
-      { text: '🤖 Create New Bot', style: BUTTON_STYLES.SUCCESS },
-      { text: '📂 My Created Bots', style: BUTTON_STYLES.PRIMARY },
+      { text: MASTER_MAIN_BUTTONS.CREATE_BOT, style: BUTTON_STYLES.SUCCESS },
+      { text: MASTER_MAIN_BUTTONS.MY_BOTS, style: BUTTON_STYLES.PRIMARY },
     ],
     [
-      { text: '🎨 Theme Studio', style: BUTTON_STYLES.PRIMARY },
-      { text: '🧩 Custom Bot Builder', style: BUTTON_STYLES.SUCCESS },
+      { text: MASTER_MAIN_BUTTONS.TEMPLATE_STUDIO, style: BUTTON_STYLES.PRIMARY },
+      { text: MASTER_MAIN_BUTTONS.CUSTOM_BUILDER, style: BUTTON_STYLES.SUCCESS },
     ],
     [
-      { text: '📊 My Statistics', style: BUTTON_STYLES.PRIMARY },
-      { text: '💎 Plans & Features', style: BUTTON_STYLES.PRIMARY },
+      { text: MASTER_MAIN_BUTTONS.MY_STATS, style: BUTTON_STYLES.PRIMARY },
+      { text: MASTER_MAIN_BUTTONS.PLANS_FEATURES, style: BUTTON_STYLES.PRIMARY },
     ],
-    [{ text: '📢 Help & Support', style: BUTTON_STYLES.DEFAULT }],
+    [
+      { text: MASTER_MAIN_BUTTONS.ACCOUNT_SETTINGS, style: BUTTON_STYLES.PRIMARY },
+      { text: MASTER_MAIN_BUTTONS.ADD_SUPPORT, style: BUTTON_STYLES.SUCCESS },
+    ],
+    [{ text: MASTER_MAIN_BUTTONS.HELP_SUPPORT, style: BUTTON_STYLES.PRIMARY }],
   ];
 
   if (isOwner) {
-    rows.push([{ text: '👑 Owner Control Center', style: BUTTON_STYLES.DANGER }]);
+    rows.push([{ text: MASTER_MAIN_BUTTONS.OWNER_CENTER, style: BUTTON_STYLES.DANGER }]);
   }
 
   return buildReplyKeyboard(rows, {
     resize: true,
     persistent: true,
-    placeholder: 'Select a BOT FACTORY action...',
+    placeholder: 'BOT FACTORY — Build. Customize. Deploy.',
   });
 }
 
 /**
- * Master Bot Inline Main Dashboard Keyboard.
+ * Owner Control Center Native ReplyKeyboard — Exact 12 Vibrant Sections + Exit button.
+ */
+export function buildOwnerControlReplyKeyboard() {
+  return buildReplyKeyboard(
+    [
+      [
+        { text: OWNER_CONTROL_BUTTONS.OVERVIEW, style: BUTTON_STYLES.PRIMARY },
+        { text: OWNER_CONTROL_BUTTONS.MANAGE_USERS, style: BUTTON_STYLES.PRIMARY },
+      ],
+      [
+        { text: OWNER_CONTROL_BUTTONS.ALL_BOTS, style: BUTTON_STYLES.SUCCESS },
+        { text: OWNER_CONTROL_BUTTONS.TEMPLATE_MGMT, style: BUTTON_STYLES.PRIMARY },
+      ],
+      [
+        { text: OWNER_CONTROL_BUTTONS.BROADCAST_CENTER, style: BUTTON_STYLES.SUCCESS },
+        { text: OWNER_CONTROL_BUTTONS.FORCE_JOIN, style: BUTTON_STYLES.PRIMARY },
+      ],
+      [
+        { text: OWNER_CONTROL_BUTTONS.SUPPORT_MGMT, style: BUTTON_STYLES.PRIMARY },
+        { text: OWNER_CONTROL_BUTTONS.PLANS_REFERRALS, style: BUTTON_STYLES.SUCCESS },
+      ],
+      [
+        { text: OWNER_CONTROL_BUTTONS.ADMIN_MGMT, style: BUTTON_STYLES.DANGER },
+        { text: OWNER_CONTROL_BUTTONS.CF_MONITOR, style: BUTTON_STYLES.PRIMARY },
+      ],
+      [
+        { text: OWNER_CONTROL_BUTTONS.ACTIVITY_LOGS, style: BUTTON_STYLES.PRIMARY },
+        { text: OWNER_CONTROL_BUTTONS.PLATFORM_SETTINGS, style: BUTTON_STYLES.PRIMARY },
+      ],
+      [{ text: OWNER_CONTROL_BUTTONS.EXIT_OWNER, style: BUTTON_STYLES.DANGER }],
+    ],
+    {
+      resize: true,
+      persistent: true,
+      placeholder: 'BOT FACTORY Owner Control Center...',
+    }
+  );
+}
+
+/**
+ * Preserved export for backward compatibility (kept colourful, zero unstyled buttons).
  */
 export function buildMasterMainInlineKeyboard(isOwner = false) {
   const rows = [
     [
-      inlineButton({ text: '🤖 Create New Bot', callbackData: 'mb:create', style: BUTTON_STYLES.SUCCESS }),
-      inlineButton({ text: '📂 My Created Bots', callbackData: 'mb:my_bots', style: BUTTON_STYLES.PRIMARY }),
+      inlineButton({ text: MASTER_MAIN_BUTTONS.CREATE_BOT, callbackData: 'mb:create', style: BUTTON_STYLES.SUCCESS }),
+      inlineButton({ text: MASTER_MAIN_BUTTONS.MY_BOTS, callbackData: 'mb:my_bots', style: BUTTON_STYLES.PRIMARY }),
     ],
     [
-      inlineButton({ text: '🎨 Theme Studio', callbackData: 'mb:theme_studio', style: BUTTON_STYLES.PRIMARY }),
-      inlineButton({ text: '🧩 Custom Bot Builder', callbackData: 'mb:builder', style: BUTTON_STYLES.SUCCESS }),
+      inlineButton({ text: MASTER_MAIN_BUTTONS.TEMPLATE_STUDIO, callbackData: 'mb:template_studio', style: BUTTON_STYLES.PRIMARY }),
+      inlineButton({ text: MASTER_MAIN_BUTTONS.CUSTOM_BUILDER, callbackData: 'mb:builder', style: BUTTON_STYLES.SUCCESS }),
     ],
     [
-      inlineButton({ text: '📊 My Statistics', callbackData: 'mb:stats', style: BUTTON_STYLES.PRIMARY }),
-      inlineButton({ text: '💎 Plans & Features', callbackData: 'mb:plans', style: BUTTON_STYLES.PRIMARY }),
+      inlineButton({ text: MASTER_MAIN_BUTTONS.MY_STATS, callbackData: 'mb:stats', style: BUTTON_STYLES.PRIMARY }),
+      inlineButton({ text: MASTER_MAIN_BUTTONS.PLANS_FEATURES, callbackData: 'mb:plans', style: BUTTON_STYLES.PRIMARY }),
     ],
-    [inlineButton({ text: '📢 Help & Support', callbackData: 'mb:help', style: BUTTON_STYLES.DEFAULT })],
+    [
+      inlineButton({ text: MASTER_MAIN_BUTTONS.ACCOUNT_SETTINGS, callbackData: 'mb:settings', style: BUTTON_STYLES.PRIMARY }),
+      inlineButton({ text: MASTER_MAIN_BUTTONS.ADD_SUPPORT, callbackData: 'mb:add_support', style: BUTTON_STYLES.SUCCESS }),
+    ],
+    [inlineButton({ text: MASTER_MAIN_BUTTONS.HELP_SUPPORT, callbackData: 'mb:help', style: BUTTON_STYLES.PRIMARY })],
   ];
 
   if (isOwner) {
     rows.push([
-      inlineButton({ text: '👑 Owner Control Center', callbackData: 'owner:home', style: BUTTON_STYLES.DANGER }),
+      inlineButton({ text: MASTER_MAIN_BUTTONS.OWNER_CENTER, callbackData: 'owner:home', style: BUTTON_STYLES.DANGER }),
     ]);
   }
 

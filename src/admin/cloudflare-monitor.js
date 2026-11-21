@@ -1,14 +1,22 @@
 /**
- * Cloudflare Infrastructure Monitor.
+ * Two-Layer Cloudflare Infrastructure Monitor.
  *
- * Uses official Cloudflare GraphQL Analytics API & REST API when least-privilege
- * secrets (CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID) are configured.
+ * LAYER 1 — APPLICATION HEALTH (Works immediately via existing Worker bindings — NO Cloudflare API token required):
+ * - Worker runtime responsiveness
+ * - Cloudflare D1 connectivity, schema integrity, and query latency
+ * - Cloudflare KV connectivity (real read/write/delete probe)
+ * - Cloudflare Analytics Engine binding status
+ * - Master Bot webhook status (from D1)
+ * - Tenant Bot webhook health summary (verified / failed / disabled)
+ * - Application errors & recent deployments
  *
- * STRICT HONESTY RULE:
- * - Clearly separates Application-level D1 counters from Cloudflare Infrastructure metrics.
- * - If Cloudflare API credentials or datasets are unavailable, explicitly returns
- *   status: 'unavailable' and null metric values — NEVER invents fake live metrics.
+ * LAYER 2 — CLOUDFLARE ACCOUNT METRICS (Optional — requires CLOUDFLARE_ACCOUNT_ID + CLOUDFLARE_API_TOKEN):
+ * - Workers, D1, and KV account-level GraphQL metrics
+ * - When credentials are absent, explicitly reports "Account-level metrics are not configured."
+ *   WITHOUT marking a healthy application as broken or failed!
  */
+
+import { verifyDatabaseSchema } from '../database/migrations.js';
 
 const CF_GRAPHQL_URL = 'https://api.cloudflare.com/client/v4/graphql';
 const CF_API_BASE = 'https://api.cloudflare.com/client/v4';
@@ -33,37 +41,141 @@ async function queryCloudflareGraphQL(apiToken, query, variables, fetchImpl = gl
   return body?.data || null;
 }
 
+async function probeKvBinding(kv) {
+  if (!kv) {
+    return { bound: false, healthy: false, latencyMs: null, detail: 'KV binding not attached' };
+  }
+  const start = Date.now();
+  const key = 'health:ping';
+  const marker = String(start);
+  try {
+    await kv.put(key, marker, { expirationTtl: 60 });
+    const readBack = await kv.get(key);
+    await kv.delete(key).catch(() => {});
+    return {
+      bound: true,
+      healthy: readBack === marker,
+      latencyMs: Date.now() - start,
+      detail: readBack === marker ? 'Read/write verified' : 'KV write/read mismatch',
+    };
+  } catch (err) {
+    return {
+      bound: true,
+      healthy: false,
+      latencyMs: Date.now() - start,
+      detail: err?.message || 'KV probe failed',
+    };
+  }
+}
+
 export async function getCloudflareInfrastructureMetrics(env, repos, fetchImpl = globalThis.fetch) {
   const checkedAt = new Date().toISOString();
-  const appMetrics = await repos.stats.getPlatformOverview();
 
+  // =========================================================================
+  // LAYER 1: APPLICATION HEALTH (Always Live via Worker Bindings)
+  // =========================================================================
+  const [appMetrics, schemaHealth, kvProbe, settingsRes, recentDeployments] = await Promise.all([
+    repos.stats.getPlatformOverview(),
+    verifyDatabaseSchema(repos.db).catch((err) => ({
+      healthy: false,
+      tableCount: 0,
+      missingTables: [],
+      seededTemplates: 0,
+      latencyMs: null,
+      error: err?.message || 'D1 check failed',
+    })),
+    probeKvBinding(env?.KV),
+    repos.stats.getSettings().catch(() => ({ map: {} })),
+    repos.deployments ? repos.deployments.listRecent(10) : Promise.resolve([]),
+  ]);
+
+  const sMap = settingsRes.map || {};
+  const d1Healthy = Boolean(schemaHealth?.healthy);
+  const overallAppHealthy = d1Healthy && (kvProbe.bound ? kvProbe.healthy : true);
+
+  const applicationHealth = {
+    status: overallAppHealthy ? 'healthy' : 'degraded',
+    checkedAt,
+    worker: {
+      healthy: true,
+      scriptName: env?.CLOUDFLARE_WORKER_SCRIPT_NAME || 'botfactory',
+      publicUrl: env?.WORKER_PUBLIC_URL || 'https://botfactory.rimpirimpi141.workers.dev',
+    },
+    d1: {
+      bound: Boolean(env?.DB),
+      healthy: d1Healthy,
+      latencyMs: schemaHealth?.latencyMs ?? null,
+      tableCount: schemaHealth?.tableCount ?? 0,
+      seededTemplates: schemaHealth?.seededTemplates ?? 0,
+      upgrade0003Applied: Boolean(schemaHealth?.upgrade0003Applied),
+      missingTables: schemaHealth?.missingTables || [],
+    },
+    kv: kvProbe,
+    analyticsEngine: {
+      bound: Boolean(env?.ANALYTICS),
+      status: env?.ANALYTICS ? 'bound_write_active' : 'not_bound',
+    },
+    masterWebhook: {
+      status: sMap.master_webhook_last_status || 'not_registered',
+      verified: sMap.master_webhook_last_status === 'verified',
+      lastRegisteredAt: sMap.master_webhook_last_registered_at || null,
+      lastVerifiedAt: sMap.master_webhook_last_verified_at || null,
+      lastError: sMap.master_webhook_last_error || null,
+    },
+    tenantWebhooks: {
+      totalBots: appMetrics.totalBots,
+      verifiedActive: appMetrics.activeBots,
+      failedDeployments: appMetrics.failedDeployments,
+      disabledBots: appMetrics.disabledBots,
+    },
+    applicationErrors: appMetrics.workerErrors,
+    recentDeployments,
+  };
+
+  const applicationCounters = {
+    source: 'Cloudflare D1 (Application-Level)',
+    requestsToday: appMetrics.requestsToday,
+    requestsThisMonth: appMetrics.requestsThisMonth,
+    workerErrors: appMetrics.workerErrors,
+    avgResponseTimeMs: appMetrics.avgResponseTimeMs,
+    totalWebhookUpdates: appMetrics.totalWebhookUpdates,
+  };
+
+  // =========================================================================
+  // LAYER 2: CLOUDFLARE ACCOUNT METRICS (Optional API Credentials)
+  // =========================================================================
   const accountId = env?.CLOUDFLARE_ACCOUNT_ID;
   const apiToken = env?.CLOUDFLARE_API_TOKEN;
-  const scriptName = env?.CLOUDFLARE_WORKER_SCRIPT_NAME || 'bot-factory';
+  const scriptName = env?.CLOUDFLARE_WORKER_SCRIPT_NAME || 'botfactory';
   const d1DatabaseId = env?.CLOUDFLARE_D1_DATABASE_ID || '';
   const kvNamespaceId = env?.CLOUDFLARE_KV_NAMESPACE_ID || '';
 
   if (!accountId || !apiToken) {
-    return {
+    const accountMetrics = {
       configured: false,
-      status: 'unavailable',
-      message: 'Cloudflare API credentials (CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN) are not configured as Worker secrets.',
-      lastUpdated: checkedAt,
-      applicationCounters: {
-        source: 'Cloudflare D1 (Application-Level)',
-        requestsToday: appMetrics.requestsToday,
-        requestsThisMonth: appMetrics.requestsThisMonth,
-        workerErrors: appMetrics.workerErrors,
-        avgResponseTimeMs: appMetrics.avgResponseTimeMs,
-        totalWebhookUpdates: appMetrics.totalWebhookUpdates,
-      },
+      status: 'not_configured',
+      message: 'Account-level metrics are not configured.',
+      detail:
+        'Application Health above is fully live via Worker bindings. Add optional CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN secrets to view account-wide Cloudflare GraphQL billing & quota telemetry.',
       workers: { status: 'unavailable', data: null },
       d1: { status: 'unavailable', data: null },
       kv: { status: 'unavailable', data: null },
-      analyticsEngine: {
-        bound: Boolean(env?.ANALYTICS),
-        status: env?.ANALYTICS ? 'bound_write_active' : 'unavailable',
-      },
+    };
+
+    return {
+      // Layer 1 & Layer 2 structured objects
+      applicationHealth,
+      accountMetrics,
+      // Backward-compatible top-level properties
+      configured: false,
+      status: 'unavailable',
+      message: accountMetrics.message,
+      lastUpdated: checkedAt,
+      applicationCounters,
+      workers: accountMetrics.workers,
+      d1: accountMetrics.d1,
+      kv: accountMetrics.kv,
+      analyticsEngine: applicationHealth.analyticsEngine,
     };
   }
 
@@ -74,25 +186,13 @@ export async function getCloudflareInfrastructureMetrics(env, repos, fetchImpl =
   const todayDate = startOfDay.slice(0, 10);
   const monthStartDate = startOfMonth.slice(0, 10);
 
-  const result = {
+  const accountMetrics = {
     configured: true,
     status: 'connected',
-    lastUpdated: checkedAt,
-    applicationCounters: {
-      source: 'Cloudflare D1 (Application-Level)',
-      requestsToday: appMetrics.requestsToday,
-      requestsThisMonth: appMetrics.requestsThisMonth,
-      workerErrors: appMetrics.workerErrors,
-      avgResponseTimeMs: appMetrics.avgResponseTimeMs,
-      totalWebhookUpdates: appMetrics.totalWebhookUpdates,
-    },
+    message: 'Cloudflare Account GraphQL API connected.',
     workers: { status: 'unavailable', data: null, error: null },
     d1: { status: 'unavailable', data: null, error: null },
     kv: { status: 'unavailable', data: null, error: null },
-    analyticsEngine: {
-      bound: Boolean(env?.ANALYTICS),
-      status: env?.ANALYTICS ? 'bound_write_active' : 'unavailable',
-    },
   };
 
   // 1. Workers Analytics (GraphQL)
@@ -136,7 +236,7 @@ export async function getCloudflareInfrastructureMetrics(env, repos, fetchImpl =
     const successRate =
       monthlyRequests > 0 ? Number((((monthlyRequests - monthlyErrors) / monthlyRequests) * 100).toFixed(2)) : null;
 
-    result.workers = {
+    accountMetrics.workers = {
       status: 'available',
       data: {
         scriptName,
@@ -149,10 +249,10 @@ export async function getCloudflareInfrastructureMetrics(env, repos, fetchImpl =
       },
     };
   } catch (err) {
-    result.workers = { status: 'unavailable', data: null, error: err?.message || 'Workers metrics unavailable' };
+    accountMetrics.workers = { status: 'unavailable', data: null, error: err?.message || 'Workers metrics unavailable' };
   }
 
-  // 2. D1 Database Metrics (GraphQL + REST database info)
+  // 2. D1 Database Metrics
   try {
     let databaseSizeBytes = null;
     if (d1DatabaseId) {
@@ -189,7 +289,7 @@ export async function getCloudflareInfrastructureMetrics(env, repos, fetchImpl =
     const rowsRead = groups.reduce((s, g) => s + Number(g?.sum?.rowsRead || 0), 0);
     const rowsWritten = groups.reduce((s, g) => s + Number(g?.sum?.rowsWritten || 0), 0);
 
-    result.d1 = {
+    accountMetrics.d1 = {
       status: 'available',
       data: {
         databaseId: d1DatabaseId || null,
@@ -202,10 +302,10 @@ export async function getCloudflareInfrastructureMetrics(env, repos, fetchImpl =
       },
     };
   } catch (err) {
-    result.d1 = { status: 'unavailable', data: null, error: err?.message || 'D1 metrics unavailable' };
+    accountMetrics.d1 = { status: 'unavailable', data: null, error: err?.message || 'D1 metrics unavailable' };
   }
 
-  // 3. KV Storage Metrics (GraphQL)
+  // 3. KV Storage Metrics
   try {
     const kvQuery = `
       query KVMetrics($accountTag: String!, $start: Date!, $end: Date!) {
@@ -240,7 +340,7 @@ export async function getCloudflareInfrastructureMetrics(env, repos, fetchImpl =
       if (action === 'write' || action === 'delete') writes += count;
     }
 
-    result.kv = {
+    accountMetrics.kv = {
       status: 'available',
       data: {
         namespaceId: kvNamespaceId || null,
@@ -251,8 +351,19 @@ export async function getCloudflareInfrastructureMetrics(env, repos, fetchImpl =
       },
     };
   } catch (err) {
-    result.kv = { status: 'unavailable', data: null, error: err?.message || 'KV metrics unavailable' };
+    accountMetrics.kv = { status: 'unavailable', data: null, error: err?.message || 'KV metrics unavailable' };
   }
 
-  return result;
+  return {
+    applicationHealth,
+    accountMetrics,
+    configured: true,
+    status: 'connected',
+    lastUpdated: checkedAt,
+    applicationCounters,
+    workers: accountMetrics.workers,
+    d1: accountMetrics.d1,
+    kv: accountMetrics.kv,
+    analyticsEngine: applicationHealth.analyticsEngine,
+  };
 }

@@ -14,7 +14,7 @@ import {
 } from 'lucide-react';
 import type { BotBrandingConfig, BotRecord, BuilderMenu, WorkerConnection } from '../api';
 import { createWorkerApi } from '../api';
-import { DEFAULT_BUILDER_MENUS, TEMPLATE_CATALOG, THEME_OPTIONS } from '../catalog';
+import { DEFAULT_BUILDER_MENUS, FUNCTIONAL_TEMPLATES, THEME_OPTIONS } from '../catalog';
 
 interface BotsPanelProps {
   connection: WorkerConnection;
@@ -54,6 +54,9 @@ export function BotsPanel({
   const [validatedBot, setValidatedBot] = useState<{ telegramBotId: string; telegramUsername: string; telegramFirstName: string } | null>(null);
   const [displayName, setDisplayName] = useState('');
   const [description, setDescription] = useState('');
+  const [festiveCampaignName, setFestiveCampaignName] = useState('Festive Celebration Bonus');
+  const [festiveReward, setFestiveReward] = useState('50');
+  const [festiveMinRefs, setFestiveMinRefs] = useState('0');
   const [branding, setBranding] = useState<BotBrandingConfig>({
     brandTitle: '',
     welcomeMessage: '',
@@ -73,7 +76,7 @@ export function BotsPanel({
       if (initialTemplateSlug === 'custom-builder') {
         setMode('custom');
         setTemplateSlug('custom-builder');
-      } else {
+      } else if (FUNCTIONAL_TEMPLATES.some((t) => t.slug === initialTemplateSlug)) {
         setMode('template');
         setTemplateSlug(initialTemplateSlug);
       }
@@ -154,6 +157,14 @@ export function BotsPanel({
     try {
       const selectedTpl = mode === 'custom' ? 'custom-builder' : templateSlug;
       const customMenus: BuilderMenu[] | undefined = mode === 'custom' ? DEFAULT_BUILDER_MENUS : undefined;
+      const templateConfig =
+        mode === 'template' && selectedTpl === 'festive-bonus'
+          ? {
+              campaignName: festiveCampaignName.trim() || 'Festive Bonus Campaign',
+              rewardAmount: Math.max(1, Number(festiveReward) || 50),
+              minReferrals: Math.max(0, Number(festiveMinRefs) || 0),
+            }
+          : undefined;
       const res = await api.deployBot({
         token: rawToken,
         templateId: selectedTpl,
@@ -166,6 +177,7 @@ export function BotsPanel({
           welcomeMessage: branding.welcomeMessage.trim() || description.trim() || 'Welcome!',
         },
         customMenus,
+        templateConfig,
       });
       setRawToken(''); // Immediately clear sensitive token from component memory
       setDeployResult({ bot: res.bot, webhookUrl: res.verification.webhookUrl, stages: res.stages });
@@ -178,7 +190,7 @@ export function BotsPanel({
   }
 
   return (
-    <div className="space-y-5">
+    <div className="animate-fade-slide-up space-y-5">
       {/* Toolbar */}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex flex-wrap items-center gap-3">
@@ -353,7 +365,7 @@ export function BotsPanel({
       {/* Real Multi-Tenant Bot Deployment Modal */}
       {openDeployModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4 backdrop-blur-sm">
-          <div className="max-h-[90vh] w-full max-w-2xl overflow-y-auto rounded-xl border border-slate-800 bg-[#0D1322] shadow-2xl">
+          <div className="animate-modal-pop max-h-[90vh] w-full max-w-2xl overflow-y-auto rounded-xl border border-slate-800 bg-[#0D1322] shadow-2xl">
             <div className="flex items-center justify-between border-b border-slate-800 px-6 py-4">
               <div>
                 <h2 className="font-display text-lg font-semibold text-white">Deploy Multi-Tenant Telegram Bot</h2>
@@ -395,7 +407,7 @@ export function BotsPanel({
                     }`}
                   >
                     <div className="font-semibold">Prebuilt Template</div>
-                    <div className="mt-0.5 text-[11px] text-slate-400">7 modular production templates</div>
+                    <div className="mt-0.5 text-[11px] text-slate-400">11 functional templates (all plans)</div>
                   </button>
                   <button
                     type="button"
@@ -407,25 +419,62 @@ export function BotsPanel({
                     }`}
                   >
                     <div className="font-semibold">Custom No-Code Builder</div>
-                    <div className="mt-0.5 text-[11px] text-slate-400">Visual submenus & colourful buttons</div>
+                    <div className="mt-0.5 text-[11px] text-slate-400">Visual submenus &amp; dynamic admin panel</div>
                   </button>
                 </div>
               </div>
 
               {mode === 'template' && (
-                <div>
-                  <label className="mb-1.5 block text-xs font-medium text-slate-300">2. Select Prebuilt Template</label>
-                  <select
-                    value={templateSlug}
-                    onChange={(e) => setTemplateSlug(e.target.value)}
-                    className="w-full rounded-lg border border-slate-700 bg-[#070B14] px-3 py-2.5 text-xs text-slate-100 focus:border-blue-500 focus:outline-none"
-                  >
-                    {TEMPLATE_CATALOG.map((t) => (
-                      <option key={t.id} value={t.slug}>
-                        {t.name} ({t.category})
-                      </option>
-                    ))}
-                  </select>
+                <div className="space-y-3">
+                  <div>
+                    <label className="mb-1.5 block text-xs font-medium text-slate-300">2. Select Prebuilt Template</label>
+                    <select
+                      value={templateSlug}
+                      onChange={(e) => setTemplateSlug(e.target.value)}
+                      className="w-full rounded-lg border border-slate-700 bg-[#070B14] px-3 py-2.5 text-xs text-slate-100 focus:border-blue-500 focus:outline-none"
+                    >
+                      {FUNCTIONAL_TEMPLATES.map((t) => (
+                        <option key={t.id} value={t.slug}>
+                          {t.name} ({t.category})
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  {templateSlug === 'festive-bonus' && (
+                    <div className="grid gap-3 rounded-lg border border-blue-500/30 bg-blue-500/5 p-3.5 sm:grid-cols-3">
+                      <div>
+                        <label className="mb-1 block text-[11px] text-slate-300">Campaign Name</label>
+                        <input
+                          type="text"
+                          value={festiveCampaignName}
+                          onChange={(e) => setFestiveCampaignName(e.target.value)}
+                          placeholder="Diwali Bonus 2026"
+                          className="w-full rounded border border-slate-700 bg-[#070B14] px-2.5 py-1.5 text-xs text-white"
+                        />
+                      </div>
+                      <div>
+                        <label className="mb-1 block text-[11px] text-slate-300">Bonus Reward</label>
+                        <input
+                          type="number"
+                          min={1}
+                          value={festiveReward}
+                          onChange={(e) => setFestiveReward(e.target.value)}
+                          className="w-full rounded border border-slate-700 bg-[#070B14] px-2.5 py-1.5 font-mono text-xs text-white"
+                        />
+                      </div>
+                      <div>
+                        <label className="mb-1 block text-[11px] text-slate-300">Min Referrals</label>
+                        <input
+                          type="number"
+                          min={0}
+                          value={festiveMinRefs}
+                          onChange={(e) => setFestiveMinRefs(e.target.value)}
+                          className="w-full rounded border border-slate-700 bg-[#070B14] px-2.5 py-1.5 font-mono text-xs text-white"
+                        />
+                      </div>
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -525,6 +574,23 @@ export function BotsPanel({
                   />
                 </div>
               </div>
+
+              {deploying && (
+                <div className="rounded-lg border border-blue-500/30 bg-blue-500/5 p-4 text-xs">
+                  <div className="flex items-center gap-2 font-display text-sm font-semibold text-blue-300">
+                    <RefreshCw className="h-4 w-4 animate-spin" />
+                    Executing 6-Stage Real Deployment Pipeline...
+                  </div>
+                  <ol className="mt-2.5 grid gap-1.5 font-mono text-[11px] text-slate-300 sm:grid-cols-2">
+                    <li>1/6 Validate token via Telegram getMe</li>
+                    <li>2/6 Encrypt token (AES-256-GCM) &amp; build config</li>
+                    <li>3/6 Persist tenant record to Cloudflare D1</li>
+                    <li>4/6 Register webhook via setWebhook</li>
+                    <li>5/6 Verify live URL via getWebhookInfo</li>
+                    <li>6/6 Activate bot &amp; invalidate KV cache</li>
+                  </ol>
+                </div>
+              )}
 
               {deployError && (
                 <div className="flex items-start gap-2 rounded-lg border border-red-500/30 bg-red-500/10 p-3 text-xs text-red-300">

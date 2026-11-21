@@ -1,5 +1,16 @@
-import React, { useEffect, useState } from 'react';
-import { ArrowDown, ArrowUp, Copy, Download, Plus, Save, Trash2, CheckCircle2, AlertCircle } from 'lucide-react';
+import React, { useEffect, useMemo, useState } from 'react';
+import {
+  AlertCircle,
+  ArrowDown,
+  ArrowUp,
+  CheckCircle2,
+  Copy,
+  Download,
+  Plus,
+  Save,
+  Shield,
+  Trash2,
+} from 'lucide-react';
 import type { BotBrandingConfig, BotRecord, BuilderButton, BuilderMenu, WorkerConnection } from '../api';
 import { createWorkerApi } from '../api';
 import { copyTextSafely } from '../clipboard';
@@ -19,6 +30,80 @@ const TELEGRAM_STYLE_CLASSES: Record<BuilderButton['style'], string> = {
   danger: 'bg-red-600 text-white border-red-500',
   default: 'bg-slate-800 text-slate-200 border-slate-700',
 };
+
+type ExtendedActionKind =
+  | 'submenu'
+  | 'message'
+  | 'info'
+  | 'collect_input'
+  | 'catalogue'
+  | 'create_order'
+  | 'submit_request'
+  | 'support'
+  | 'url'
+  | 'feature'
+  | 'back';
+
+function getUiActionKind(btn: BuilderButton): ExtendedActionKind {
+  if (btn.actionType === 'feature') {
+    const p = btn.actionPayload || '';
+    if (p.startsWith('info:')) return 'info';
+    if (p.startsWith('form:')) return 'collect_input';
+    if (p.startsWith('catalogue:')) return 'catalogue';
+    if (p.startsWith('create_order:')) return 'create_order';
+    if (p.startsWith('submit_request:')) return 'submit_request';
+  }
+  return btn.actionType;
+}
+
+function stripPrefix(payload: string, prefix: string) {
+  return payload.startsWith(prefix) ? payload.slice(prefix.length) : payload;
+}
+
+function computeDynamicAdminModules(menus: BuilderMenu[]) {
+  const allButtons = menus.flatMap((m) => m.buttons);
+  let hasProducts = false;
+  let hasOrders = false;
+  let hasForms = false;
+  let hasSupport = false;
+
+  for (const b of allButtons) {
+    const p = b.actionPayload || '';
+    if (b.actionType === 'support' || p === 'support_contact') hasSupport = true;
+    if (b.actionType === 'feature') {
+      if (p.startsWith('catalogue:')) hasProducts = true;
+      if (p.startsWith('create_order:')) {
+        hasProducts = true;
+        hasOrders = true;
+      }
+      if (p.startsWith('form:') || p.startsWith('submit_request:')) hasForms = true;
+    }
+  }
+
+  const modules: Array<{ label: string; style: 'success' | 'primary' | 'danger'; reason: string }> = [
+    { label: '📊 Bot Analytics', style: 'primary', reason: 'Core module' },
+    { label: '👥 Manage Users', style: 'primary', reason: 'Core module' },
+    { label: '📢 Force Join', style: 'primary', reason: 'Core module' },
+    { label: '📣 Broadcast Users', style: 'success', reason: 'Core module' },
+  ];
+
+  if (hasProducts) {
+    modules.push({ label: '🛍 Manage Products', style: 'success', reason: 'Detected Catalogue / Order button' });
+  }
+  if (hasOrders) {
+    modules.push({ label: '📦 Manage Orders', style: 'primary', reason: 'Detected Create Order action' });
+    modules.push({ label: '💳 Payment Verification', style: 'danger', reason: 'Detected Paid Order flow' });
+  }
+  if (hasForms) {
+    modules.push({ label: '📥 Form Submissions', style: 'primary', reason: 'Detected Input / Request form' });
+  }
+  if (hasSupport) {
+    modules.push({ label: '🆘 Support Settings', style: 'primary', reason: 'Detected Support button' });
+  }
+  modules.push({ label: '⚙️ Bot Settings', style: 'primary', reason: 'Core module' });
+
+  return modules;
+}
 
 export function BuilderPanel({ connection, connected, bots, selectedBotId, onSelectBotId }: BuilderPanelProps) {
   const [menus, setMenus] = useState<BuilderMenu[]>(DEFAULT_BUILDER_MENUS);
@@ -62,6 +147,7 @@ export function BuilderPanel({ connection, connected, bots, selectedBotId, onSel
   }, [connected, selectedBotId]);
 
   const activeMenu = menus.find((m) => m.menuKey === activeMenuKey) || menus[0];
+  const dynamicAdminModules = useMemo(() => computeDynamicAdminModules(menus), [menus]);
 
   function updateActiveMenu(patch: Partial<BuilderMenu>) {
     setMenus((prev) => prev.map((m) => (m.menuKey === activeMenu.menuKey ? { ...m, ...patch } : m)));
@@ -130,6 +216,41 @@ export function BuilderPanel({ connection, connected, bots, selectedBotId, onSel
     });
   }
 
+  function handleActionKindChange(btn: BuilderButton, kind: ExtendedActionKind) {
+    switch (kind) {
+      case 'info':
+        updateButton(btn.id, { actionType: 'feature', actionPayload: 'info:Important information for your users.' });
+        break;
+      case 'collect_input':
+        updateButton(btn.id, { actionType: 'feature', actionPayload: 'form:Please reply with your details:' });
+        break;
+      case 'submit_request':
+        updateButton(btn.id, { actionType: 'feature', actionPayload: 'submit_request:Describe your request:' });
+        break;
+      case 'catalogue':
+        updateButton(btn.id, { actionType: 'feature', actionPayload: 'catalogue:all' });
+        break;
+      case 'create_order':
+        updateButton(btn.id, { actionType: 'feature', actionPayload: 'create_order:all' });
+        break;
+      case 'submenu':
+      case 'back':
+        updateButton(btn.id, { actionType: kind, actionPayload: menus[0]?.menuKey || 'main' });
+        break;
+      case 'feature':
+        updateButton(btn.id, { actionType: 'feature', actionPayload: 'user_profile' });
+        break;
+      case 'url':
+        updateButton(btn.id, { actionType: 'url', actionPayload: 'https://example.com' });
+        break;
+      case 'support':
+        updateButton(btn.id, { actionType: 'support', actionPayload: 'Contact our support desk for assistance.' });
+        break;
+      default:
+        updateButton(btn.id, { actionType: 'message', actionPayload: 'Configure your response text here.' });
+    }
+  }
+
   function moveButton(index: number, dir: -1 | 1) {
     const target = index + dir;
     if (target < 0 || target >= activeMenu.buttons.length) return;
@@ -163,7 +284,7 @@ export function BuilderPanel({ connection, connected, bots, selectedBotId, onSel
     setStatusMsg(null);
     try {
       await api.saveBuilder(selectedBotId, { config: branding, menus });
-      setStatusMsg({ type: 'ok', text: `Saved ${menus.length} menu(s) & branding to D1 and invalidated KV cache.` });
+      setStatusMsg({ type: 'ok', text: `Saved ${menus.length} menu(s) & dynamic admin rules to D1 and invalidated KV cache.` });
     } catch (err) {
       setStatusMsg({ type: 'err', text: err instanceof Error ? err.message : 'Failed to save configuration' });
     } finally {
@@ -172,7 +293,7 @@ export function BuilderPanel({ connection, connected, bots, selectedBotId, onSel
   }
 
   function exportSchemaJson() {
-    const payload = JSON.stringify({ branding, menus }, null, 2);
+    const payload = JSON.stringify({ branding, menus, dynamicAdminModules }, null, 2);
     const blob = new Blob([payload], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -183,7 +304,7 @@ export function BuilderPanel({ connection, connected, bots, selectedBotId, onSel
   }
 
   async function copySchemaJson() {
-    const copied = await copyTextSafely(JSON.stringify({ branding, menus }, null, 2));
+    const copied = await copyTextSafely(JSON.stringify({ branding, menus, dynamicAdminModules }, null, 2));
     if (copied) {
       setStatusMsg({ type: 'ok', text: 'Copied validated builder JSON schema to clipboard.' });
     } else {
@@ -191,7 +312,6 @@ export function BuilderPanel({ connection, connected, bots, selectedBotId, onSel
     }
   }
 
-  // Group buttons into Telegram rows for exact visual preview
   const previewButtons = activeMenu.buttons.filter((b) => {
     if (b.visibility === 'hidden') return false;
     if (b.visibility === 'admins' && !previewAsAdmin) return false;
@@ -203,8 +323,39 @@ export function BuilderPanel({ connection, connected, bots, selectedBotId, onSel
     previewRows.push(previewButtons.slice(i, i + cols));
   }
 
+  const guidedSteps = [
+    { num: 1, title: 'Bot Basics', done: Boolean(selectedBotId || branding.brandTitle.trim()) },
+    { num: 2, title: 'Welcome & Theme', done: Boolean(branding.welcomeMessage.trim() && branding.themeId) },
+    { num: 3, title: 'Menus & Buttons', done: menus.length > 0 && activeMenu.buttons.length > 0 },
+    {
+      num: 4,
+      title: 'Actions & Forms',
+      done: menus.some((m) => m.buttons.some((b) => b.actionType !== 'message' || Boolean(b.actionPayload))),
+    },
+    { num: 5, title: 'Dynamic Admin & Save', done: dynamicAdminModules.length >= 5 },
+  ];
+
   return (
-    <div className="space-y-5">
+    <div className="animate-fade-slide-up space-y-5">
+      {/* 5-Step Guided No-Code Builder Progress */}
+      <div className="grid gap-2 rounded-xl border border-slate-800/80 bg-[#0D1322] p-3.5 sm:grid-cols-5">
+        {guidedSteps.map((st) => (
+          <div
+            key={st.num}
+            className="flex items-center gap-2.5 rounded-lg border border-slate-800/80 bg-[#070B14] px-3 py-2 text-xs"
+          >
+            <span
+              className={`flex h-5 w-5 shrink-0 items-center justify-center rounded-md font-mono text-[11px] font-semibold ${
+                st.done ? 'bg-emerald-600/20 text-emerald-400' : 'bg-slate-800 text-slate-400'
+              }`}
+            >
+              {st.num}
+            </span>
+            <span className="truncate font-medium text-slate-200">{st.title}</span>
+          </div>
+        ))}
+      </div>
+
       {/* Top Action Bar */}
       <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-800/80 bg-[#0D1322] p-4">
         <div className="flex flex-wrap items-center gap-3">
@@ -257,7 +408,11 @@ export function BuilderPanel({ connection, connected, bots, selectedBotId, onSel
               : 'border-red-500/30 bg-red-500/10 text-red-300'
           }`}
         >
-          {statusMsg.type === 'ok' ? <CheckCircle2 className="h-4 w-4 shrink-0" /> : <AlertCircle className="h-4 w-4 shrink-0" />}
+          {statusMsg.type === 'ok' ? (
+            <CheckCircle2 className="h-4 w-4 shrink-0" />
+          ) : (
+            <AlertCircle className="h-4 w-4 shrink-0" />
+          )}
           <span>{statusMsg.text}</span>
         </div>
       )}
@@ -299,7 +454,7 @@ export function BuilderPanel({ connection, connected, bots, selectedBotId, onSel
             </div>
           </div>
 
-          <div className="rounded-xl border border-slate-800/80 bg-[#0D1322] p-4 space-y-3">
+          <div className="space-y-3 rounded-xl border border-slate-800/80 bg-[#0D1322] p-4">
             <h3 className="font-display text-xs font-semibold text-white">Theme & Branding</h3>
             <div>
               <label className="mb-1 block text-[11px] text-slate-400">Brand Title</label>
@@ -348,11 +503,13 @@ export function BuilderPanel({ connection, connected, bots, selectedBotId, onSel
 
         {/* Center: Menu & Button Configurator */}
         <div className="space-y-5 xl:col-span-5">
-          <div className="rounded-xl border border-slate-800/80 bg-[#0D1322] p-5 space-y-4">
+          <div className="space-y-4 rounded-xl border border-slate-800/80 bg-[#0D1322] p-5">
             <div className="flex items-center justify-between border-b border-slate-800 pb-3">
               <div>
                 <h3 className="font-display text-sm font-semibold text-white">Menu Settings · {activeMenu.menuKey}</h3>
-                <p className="text-[11px] text-slate-400">Declarative safe actions only (no arbitrary code execution)</p>
+                <p className="text-[11px] text-slate-400">
+                  Declarative actions automatically synthesize matching Tenant Admin Panel modules
+                </p>
               </div>
               {!activeMenu.isRoot && (
                 <button
@@ -421,139 +578,185 @@ export function BuilderPanel({ connection, connected, bots, selectedBotId, onSel
               </div>
 
               <div className="space-y-3">
-                {activeMenu.buttons.map((btn, idx) => (
-                  <div key={btn.id} className="rounded-lg border border-slate-800 bg-[#070B14] p-3 space-y-2.5">
-                    <div className="flex items-center justify-between gap-2">
-                      <div className="flex flex-1 items-center gap-2">
-                        <input
-                          type="text"
-                          value={btn.emoji}
-                          onChange={(e) => updateButton(btn.id, { emoji: e.target.value })}
-                          placeholder="⚡"
-                          className="w-11 rounded border border-slate-700 bg-[#0D1322] px-2 py-1 text-center text-xs text-white"
-                        />
-                        <input
-                          type="text"
-                          value={btn.label}
-                          onChange={(e) => updateButton(btn.id, { label: e.target.value })}
-                          placeholder="Button label"
-                          className="flex-1 rounded border border-slate-700 bg-[#0D1322] px-2.5 py-1 text-xs text-white"
-                        />
+                {activeMenu.buttons.map((btn, idx) => {
+                  const actionKind = getUiActionKind(btn);
+                  return (
+                    <div key={btn.id} className="space-y-2.5 rounded-lg border border-slate-800 bg-[#070B14] p-3">
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="flex flex-1 items-center gap-2">
+                          <input
+                            type="text"
+                            value={btn.emoji}
+                            onChange={(e) => updateButton(btn.id, { emoji: e.target.value })}
+                            placeholder="⚡"
+                            className="w-11 rounded border border-slate-700 bg-[#0D1322] px-2 py-1 text-center text-xs text-white"
+                          />
+                          <input
+                            type="text"
+                            value={btn.label}
+                            onChange={(e) => updateButton(btn.id, { label: e.target.value })}
+                            placeholder="Button label"
+                            className="flex-1 rounded border border-slate-700 bg-[#0D1322] px-2.5 py-1 text-xs text-white"
+                          />
+                        </div>
+                        <div className="flex items-center gap-1">
+                          <button
+                            onClick={() => moveButton(idx, -1)}
+                            disabled={idx === 0}
+                            className="rounded p-1 text-slate-400 hover:bg-slate-800 disabled:opacity-30"
+                            aria-label="Move up"
+                          >
+                            <ArrowUp className="h-3.5 w-3.5" />
+                          </button>
+                          <button
+                            onClick={() => moveButton(idx, 1)}
+                            disabled={idx === activeMenu.buttons.length - 1}
+                            className="rounded p-1 text-slate-400 hover:bg-slate-800 disabled:opacity-30"
+                            aria-label="Move down"
+                          >
+                            <ArrowDown className="h-3.5 w-3.5" />
+                          </button>
+                          <button
+                            onClick={() => removeButton(btn.id)}
+                            className="rounded p-1 text-red-400 hover:bg-red-500/10"
+                            aria-label="Remove button"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </button>
+                        </div>
                       </div>
-                      <div className="flex items-center gap-1">
-                        <button
-                          onClick={() => moveButton(idx, -1)}
-                          disabled={idx === 0}
-                          className="rounded p-1 text-slate-400 hover:bg-slate-800 disabled:opacity-30"
-                          aria-label="Move up"
+
+                      <div className="grid grid-cols-3 gap-2">
+                        <select
+                          value={btn.style}
+                          onChange={(e) => updateButton(btn.id, { style: e.target.value as BuilderButton['style'] })}
+                          className="rounded border border-slate-700 bg-[#0D1322] px-2 py-1 text-[11px] text-slate-200"
                         >
-                          <ArrowUp className="h-3.5 w-3.5" />
-                        </button>
-                        <button
-                          onClick={() => moveButton(idx, 1)}
-                          disabled={idx === activeMenu.buttons.length - 1}
-                          className="rounded p-1 text-slate-400 hover:bg-slate-800 disabled:opacity-30"
-                          aria-label="Move down"
+                          <option value="success">Green (success)</option>
+                          <option value="primary">Blue (primary)</option>
+                          <option value="danger">Red (danger)</option>
+                        </select>
+
+                        <select
+                          value={actionKind}
+                          onChange={(e) => handleActionKindChange(btn, e.target.value as ExtendedActionKind)}
+                          className="rounded border border-slate-700 bg-[#0D1322] px-2 py-1 text-[11px] text-slate-200"
                         >
-                          <ArrowDown className="h-3.5 w-3.5" />
-                        </button>
-                        <button
-                          onClick={() => removeButton(btn.id)}
-                          className="rounded p-1 text-red-400 hover:bg-red-500/10"
-                          aria-label="Remove button"
+                          <option value="submenu">Open Submenu</option>
+                          <option value="message">Show Message</option>
+                          <option value="info">Info Card</option>
+                          <option value="collect_input">Collect Input Form</option>
+                          <option value="submit_request">Submit Request</option>
+                          <option value="catalogue">Product Catalogue</option>
+                          <option value="create_order">Create Order (UPI)</option>
+                          <option value="support">Contact Support</option>
+                          <option value="url">Open URL</option>
+                          <option value="feature">Core Feature</option>
+                          <option value="back">Navigate Back</option>
+                        </select>
+
+                        <select
+                          value={btn.visibility}
+                          onChange={(e) => updateButton(btn.id, { visibility: e.target.value as BuilderButton['visibility'] })}
+                          className="rounded border border-slate-700 bg-[#0D1322] px-2 py-1 text-[11px] text-slate-200"
                         >
-                          <Trash2 className="h-3.5 w-3.5" />
-                        </button>
+                          <option value="all">Visible: All</option>
+                          <option value="users">Users Only</option>
+                          <option value="admins">Admins Only</option>
+                          <option value="hidden">Hidden</option>
+                        </select>
+                      </div>
+
+                      <div>
+                        {actionKind === 'submenu' || actionKind === 'back' ? (
+                          <select
+                            value={btn.actionPayload}
+                            onChange={(e) => updateButton(btn.id, { actionPayload: e.target.value })}
+                            className="w-full rounded border border-slate-700 bg-[#0D1322] px-2.5 py-1 text-[11px] text-slate-200"
+                          >
+                            {menus.map((m) => (
+                              <option key={m.menuKey} value={m.menuKey}>
+                                Target Menu: {m.title} ({m.menuKey})
+                              </option>
+                            ))}
+                          </select>
+                        ) : actionKind === 'feature' ? (
+                          <select
+                            value={btn.actionPayload}
+                            onChange={(e) => updateButton(btn.id, { actionPayload: e.target.value })}
+                            className="w-full rounded border border-slate-700 bg-[#0D1322] px-2.5 py-1 text-[11px] text-slate-200"
+                          >
+                            <option value="user_profile">Feature: User Profile</option>
+                            <option value="bot_stats">Feature: Bot Statistics (Admin)</option>
+                            <option value="referral_link">Feature: Referral Link</option>
+                            <option value="support_contact">Feature: Support Contact</option>
+                            <option value="help_overview">Feature: Help Overview</option>
+                          </select>
+                        ) : actionKind === 'collect_input' ? (
+                          <input
+                            type="text"
+                            value={stripPrefix(btn.actionPayload, 'form:')}
+                            onChange={(e) => updateButton(btn.id, { actionType: 'feature', actionPayload: `form:${e.target.value}` })}
+                            placeholder="Prompt shown to user before saving to form_submissions..."
+                            className="w-full rounded border border-slate-700 bg-[#0D1322] px-2.5 py-1 text-[11px] text-slate-200"
+                          />
+                        ) : actionKind === 'submit_request' ? (
+                          <input
+                            type="text"
+                            value={stripPrefix(btn.actionPayload, 'submit_request:')}
+                            onChange={(e) =>
+                              updateButton(btn.id, { actionType: 'feature', actionPayload: `submit_request:${e.target.value}` })
+                            }
+                            placeholder="Request prompt shown to user..."
+                            className="w-full rounded border border-slate-700 bg-[#0D1322] px-2.5 py-1 text-[11px] text-slate-200"
+                          />
+                        ) : actionKind === 'info' ? (
+                          <input
+                            type="text"
+                            value={stripPrefix(btn.actionPayload, 'info:')}
+                            onChange={(e) => updateButton(btn.id, { actionType: 'feature', actionPayload: `info:${e.target.value}` })}
+                            placeholder="Info card text..."
+                            className="w-full rounded border border-slate-700 bg-[#0D1322] px-2.5 py-1 text-[11px] text-slate-200"
+                          />
+                        ) : actionKind === 'catalogue' || actionKind === 'create_order' ? (
+                          <input
+                            type="text"
+                            value={stripPrefix(btn.actionPayload, `${actionKind}:`)}
+                            onChange={(e) =>
+                              updateButton(btn.id, {
+                                actionType: 'feature',
+                                actionPayload: `${actionKind}:${e.target.value || 'all'}`,
+                              })
+                            }
+                            placeholder="Category filter (e.g. all, templates, ebooks)"
+                            className="w-full rounded border border-slate-700 bg-[#0D1322] px-2.5 py-1 text-[11px] text-slate-200"
+                          />
+                        ) : (
+                          <input
+                            type="text"
+                            value={btn.actionPayload}
+                            onChange={(e) => updateButton(btn.id, { actionPayload: e.target.value })}
+                            placeholder={actionKind === 'url' ? 'https://example.com' : 'Message content...'}
+                            className="w-full rounded border border-slate-700 bg-[#0D1322] px-2.5 py-1 text-[11px] text-slate-200"
+                          />
+                        )}
                       </div>
                     </div>
-
-                    <div className="grid grid-cols-3 gap-2">
-                      <select
-                        value={btn.style}
-                        onChange={(e) => updateButton(btn.id, { style: e.target.value as BuilderButton['style'] })}
-                        className="rounded border border-slate-700 bg-[#0D1322] px-2 py-1 text-[11px] text-slate-200"
-                      >
-                        <option value="success">Green (success)</option>
-                        <option value="primary">Blue (primary)</option>
-                        <option value="danger">Red (danger)</option>
-                        <option value="default">Standard</option>
-                      </select>
-
-                      <select
-                        value={btn.actionType}
-                        onChange={(e) => updateButton(btn.id, { actionType: e.target.value as BuilderButton['actionType'] })}
-                        className="rounded border border-slate-700 bg-[#0D1322] px-2 py-1 text-[11px] text-slate-200"
-                      >
-                        <option value="submenu">Open Submenu</option>
-                        <option value="message">Show Message</option>
-                        <option value="url">Open URL</option>
-                        <option value="feature">Safe Feature</option>
-                        <option value="back">Navigate Back</option>
-                        <option value="support">Contact Support</option>
-                      </select>
-
-                      <select
-                        value={btn.visibility}
-                        onChange={(e) => updateButton(btn.id, { visibility: e.target.value as BuilderButton['visibility'] })}
-                        className="rounded border border-slate-700 bg-[#0D1322] px-2 py-1 text-[11px] text-slate-200"
-                      >
-                        <option value="all">Visible: All</option>
-                        <option value="users">Users Only</option>
-                        <option value="admins">Admins Only</option>
-                        <option value="hidden">Hidden</option>
-                      </select>
-                    </div>
-
-                    <div>
-                      {btn.actionType === 'submenu' || btn.actionType === 'back' ? (
-                        <select
-                          value={btn.actionPayload}
-                          onChange={(e) => updateButton(btn.id, { actionPayload: e.target.value })}
-                          className="w-full rounded border border-slate-700 bg-[#0D1322] px-2.5 py-1 text-[11px] text-slate-200"
-                        >
-                          {menus.map((m) => (
-                            <option key={m.menuKey} value={m.menuKey}>
-                              Target Menu: {m.title} ({m.menuKey})
-                            </option>
-                          ))}
-                        </select>
-                      ) : btn.actionType === 'feature' ? (
-                        <select
-                          value={btn.actionPayload}
-                          onChange={(e) => updateButton(btn.id, { actionPayload: e.target.value })}
-                          className="w-full rounded border border-slate-700 bg-[#0D1322] px-2.5 py-1 text-[11px] text-slate-200"
-                        >
-                          <option value="user_profile">Feature: User Profile</option>
-                          <option value="bot_stats">Feature: Bot Statistics (Admin)</option>
-                          <option value="referral_link">Feature: Referral Link</option>
-                          <option value="support_contact">Feature: Support Contact</option>
-                          <option value="help_overview">Feature: Help Overview</option>
-                        </select>
-                      ) : (
-                        <input
-                          type="text"
-                          value={btn.actionPayload}
-                          onChange={(e) => updateButton(btn.id, { actionPayload: e.target.value })}
-                          placeholder={btn.actionType === 'url' ? 'https://example.com' : 'Message content...'}
-                          className="w-full rounded border border-slate-700 bg-[#0D1322] px-2.5 py-1 text-[11px] text-slate-200"
-                        />
-                      )}
-                    </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             </div>
           </div>
         </div>
 
-        {/* Right: Exact Telegram Keyboard Geometry Preview */}
-        <div className="xl:col-span-4">
-          <div className="sticky top-6 rounded-xl border border-slate-800/80 bg-[#0D1322] p-5">
+        {/* Right: Exact Telegram Keyboard Preview + Dynamic Admin Panel Preview */}
+        <div className="space-y-5 xl:col-span-4">
+          <div className="rounded-xl border border-slate-800/80 bg-[#0D1322] p-5">
             <div className="mb-4 flex items-center justify-between border-b border-slate-800 pb-3">
               <div>
                 <h3 className="font-display text-sm font-semibold text-white">Keyboard Layout Preview</h3>
                 <p className="text-[11px] text-slate-400">
-                  Compiled Telegram <code className="text-slate-300">reply_markup</code> structure
+                  Compiled Telegram <code className="text-slate-300">reply_markup</code>
                 </p>
               </div>
               <button
@@ -587,12 +790,15 @@ export function BuilderPanel({ connection, connected, bots, selectedBotId, onSel
                         key={btn.id}
                         type="button"
                         onClick={() => {
-                          if ((btn.actionType === 'submenu' || btn.actionType === 'back') && menus.some((m) => m.menuKey === btn.actionPayload)) {
+                          if (
+                            (btn.actionType === 'submenu' || btn.actionType === 'back') &&
+                            menus.some((m) => m.menuKey === btn.actionPayload)
+                          ) {
                             setActiveMenuKey(btn.actionPayload);
                           }
                         }}
                         className={`truncate rounded-lg border px-3 py-2 text-center text-xs font-medium transition-opacity hover:opacity-90 ${TELEGRAM_STYLE_CLASSES[btn.style]}`}
-                        title={`Telegram style: "${btn.style}" | Action: ${btn.actionType}`}
+                        title={`Telegram style: "${btn.style}" | Action: ${getUiActionKind(btn)}`}
                       >
                         {btn.emoji ? `${btn.emoji} ` : ''}
                         {btn.label}
@@ -602,9 +808,36 @@ export function BuilderPanel({ connection, connected, bots, selectedBotId, onSel
                 ))}
               </div>
             </div>
+          </div>
 
-            <div className="mt-3 text-[11px] text-slate-500">
-              Native Telegram Bot API <code className="text-slate-400">style</code> fields emitted: <span className="text-emerald-400">success</span> · <span className="text-blue-400">primary</span> · <span className="text-red-400">danger</span>. Clients without style support fall back cleanly.
+          {/* Live Dynamic Admin Panel Preview */}
+          <div className="rounded-xl border border-slate-800/80 bg-[#0D1322] p-5">
+            <div className="mb-3 flex items-center justify-between border-b border-slate-800 pb-3">
+              <div className="flex items-center gap-2">
+                <Shield className="h-4 w-4 text-emerald-400" />
+                <div>
+                  <h3 className="font-display text-sm font-semibold text-white">Auto-Generated Admin Panel</h3>
+                  <p className="text-[11px] text-slate-400">
+                    Native ReplyKeyboard modules synthesized from your buttons
+                  </p>
+                </div>
+              </div>
+              <span className="font-mono text-[11px] text-emerald-400 tabular-nums">
+                {dynamicAdminModules.length} modules
+              </span>
+            </div>
+
+            <div className="grid grid-cols-2 gap-2">
+              {dynamicAdminModules.map((mod) => (
+                <div
+                  key={mod.label}
+                  title={mod.reason}
+                  className={`rounded-lg border px-2.5 py-2 text-xs font-medium ${TELEGRAM_STYLE_CLASSES[mod.style]}`}
+                >
+                  <div className="truncate">{mod.label}</div>
+                  <div className="mt-0.5 truncate text-[10px] opacity-80">{mod.reason}</div>
+                </div>
+              ))}
             </div>
           </div>
         </div>

@@ -57,13 +57,19 @@ export function OverviewPanel({
     {
       label: 'Active Verified Bots',
       value: overview ? `${overview.activeBots} / ${overview.totalBots}` : 'Data unavailable',
-      sub: overview ? `${overview.disabledBots} disabled · ${overview.failedDeployments} failed` : 'Connect Worker for D1 count',
+      sub: overview
+        ? `${overview.botsCreatedToday ?? 0} today · ${overview.disabledBots} disabled · ${overview.failedDeployments} failed`
+        : 'Connect Worker for D1 count',
       icon: Bot,
     },
     {
-      label: 'Registered Creators',
-      value: overview ? fmt(overview.totalUsers) : 'Data unavailable',
-      sub: overview ? `${overview.premiumUsers} premium accounts` : 'From D1 users table',
+      label: 'Creators & Verified Referrals',
+      value: overview
+        ? `${fmt(overview.totalUsers)} · ${fmt(overview.verifiedReferrals ?? 0)} refs`
+        : 'Data unavailable',
+      sub: overview
+        ? `Free ${overview.freeUsers ?? 0} · Starter ${overview.starterUsers ?? 0} · Pro ${overview.proUsers ?? 0} · Ent ${overview.enterpriseUsers ?? 0}`
+        : 'From D1 users & platform_referrals',
       icon: Users,
     },
     {
@@ -85,7 +91,7 @@ export function OverviewPanel({
   const maxDaily = Math.max(1, ...(overview?.dailySeries || []).map((d) => Number(d.requests || 0)));
 
   return (
-    <div className="space-y-6">
+    <div className="animate-fade-slide-up space-y-6">
       {!connected && (
         <div className="flex flex-col justify-between gap-4 rounded-xl border border-amber-500/30 bg-[#0D1322] p-5 sm:flex-row sm:items-center">
           <div className="flex items-start gap-3">
@@ -130,9 +136,11 @@ export function OverviewPanel({
                 <Icon className="h-4 w-4 text-slate-500" />
               </div>
               <div className="mt-3 font-mono text-2xl font-semibold tracking-tight text-white tabular-nums">
-                {loading ? '...' : item.value}
+                {loading ? <div className="bf-skeleton h-7 w-28 rounded-md" /> : item.value}
               </div>
-              <div className="mt-1.5 text-xs text-slate-500">{item.sub}</div>
+              <div className="mt-1.5 text-xs text-slate-500">
+                {loading ? <div className="bf-skeleton h-3.5 w-36 rounded" /> : item.sub}
+              </div>
             </div>
           );
         })}
@@ -187,7 +195,7 @@ export function OverviewPanel({
                     <div className="flex h-36 w-full items-end">
                       <div
                         style={{ height: `${pct}%` }}
-                        className="w-full rounded-t bg-blue-600/80 transition-colors group-hover:bg-emerald-500"
+                        className="animate-bar-grow w-full rounded-t bg-blue-600/80 transition-colors group-hover:bg-emerald-500"
                         title={`${day.stat_date}: ${day.requests} requests, ${day.errors} errors`}
                       />
                     </div>

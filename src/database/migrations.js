@@ -1,6 +1,6 @@
 /**
  * D1 Migration & Schema Health Verifier.
- * Confirms all required tables and seeded templates are present in Cloudflare D1.
+ * Confirms all core and upgrade tables and seeded templates are present in Cloudflare D1.
  */
 
 export const REQUIRED_TABLES = [
@@ -35,12 +35,27 @@ export const REQUIRED_TABLES = [
   'usage_statistics',
 ];
 
+export const UPGRADE_TABLES_0003 = [
+  'platform_referrals',
+  'platform_admins',
+  'payment_proofs',
+  'tasks',
+  'task_submissions',
+  'vouchers',
+  'voucher_claims',
+  'connected_channels',
+  'scheduled_posts',
+  'form_submissions',
+  'deployment_logs',
+];
+
 export async function verifyDatabaseSchema(db) {
   const { rows, durationMs } = await db.all(
     `SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'`
   );
   const existing = new Set(rows.map((r) => r.name));
   const missing = REQUIRED_TABLES.filter((table) => !existing.has(table));
+  const missingUpgradeTables = UPGRADE_TABLES_0003.filter((table) => !existing.has(table));
 
   let seededTemplates = 0;
   if (!missing.includes('bot_templates')) {
@@ -50,8 +65,10 @@ export async function verifyDatabaseSchema(db) {
 
   return {
     healthy: missing.length === 0 && seededTemplates >= 7,
+    upgrade0003Applied: missingUpgradeTables.length === 0,
     tableCount: existing.size,
     missingTables: missing,
+    missingUpgradeTables,
     seededTemplates,
     latencyMs: durationMs,
   };

@@ -4,6 +4,7 @@
  */
 
 import { isOwnerTelegramId } from '../utils/validation.js';
+import { buildUserReferralCode, calculatePlanEntitlement } from '../core/plans-referrals.js';
 
 export function newId(prefix) {
   return `${prefix}_${crypto.randomUUID().replace(/-/g, '').slice(0, 20)}`;
@@ -15,12 +16,14 @@ export function createRepositories(db, env) {
       const telegramId = String(tgUser.id);
       const role = isOwnerTelegramId(telegramId, env) ? 'super_admin' : 'user';
       const now = new Date().toISOString();
+      const referralCode = buildUserReferralCode(telegramId);
       const existing = await this.getByTelegramId(telegramId);
       if (existing) {
         await db.run(
           `UPDATE users
            SET username = ?, first_name = ?, last_name = ?, language_code = ?,
                role = CASE WHEN ? = 'super_admin' THEN 'super_admin' ELSE role END,
+               referral_code = COALESCE(referral_code, ?),
                last_active_at = ?, updated_at = ?
            WHERE telegram_id = ?`,
           [
@@ -29,18 +32,20 @@ export function createRepositories(db, env) {
             tgUser.last_name || '',
             tgUser.language_code || 'en',
             role,
+            referralCode,
             now,
             now,
             telegramId,
           ]
         );
-        return this.getByTelegramId(telegramId);
+        const updated = await this.getByTelegramId(telegramId);
+        return { ...updated, _isNewUser: false };
       }
 
       const id = newId('usr');
       await db.run(
-        `INSERT INTO users (id, telegram_id, username, first_name, last_name, language_code, role, last_active_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO users (id, telegram_id, username, first_name, last_name, language_code, role, referral_code, last_active_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           id,
           telegramId,
@@ -49,15 +54,80 @@ export function createRepositories(db, env) {
           tgUser.last_name || '',
           tgUser.language_code || 'en',
           role,
+          referralCode,
           now,
         ]
       );
-      return this.getByTelegramId(telegramId);
+      const created = await this.getByTelegramId(telegramId);
+      return { ...created, _isNewUser: true };
     },
 
     async getByTelegramId(telegramId) {
       const { row } = await db.first(`SELECT * FROM users WHERE telegram_id = ?`, [String(telegramId)]);
       return row;
+    },
+
+    async getByReferralCode(code) {
+      const clean = String(code || '').trim();
+      if (!clean) return null;
+      const { row } = await db.first(
+        `SELECT * FROM users WHERE referral_code = ? OR telegram_id = ?`,
+        [clean, clean.replace(/^BF/i, '')]
+      );
+      return row;
+    },
+
+    async countActiveBots(telegramId) {
+      const { row } = await db.first(
+        `SELECT COUNT(*) AS cnt FROM bots
+         WHERE owner_telegram_id = ? AND status NOT IN ('deleted', 'failed')`,
+        [String(telegramId)]
+      );
+      return Number(row?.cnt || 0);
+    },
+
+    async syncReferralMetrics(telegramId) {
+      const tid = String(telegramId);
+      const { row: cntRow } = await db.first(
+        `SELECT COUNT(*) AS verified_count FROM platform_referrals
+         WHERE referrer_telegram_id = ? AND status = 'verified'`,
+        [tid]
+      );
+      const verified = Number(cntRow?.verified_count || 0);
+      const current = await this.getByTelegramId(tid);
+      if (!current) return null;
+
+      let milestonePlan = 'free';
+      if (verified >= 50) milestonePlan = 'enterprise';
+      else if (verified >= 48) milestonePlan = 'pro';
+      else if (verified >= 8) milestonePlan = 'starter';
+
+      const planRank = { free: 0, starter: 1, pro: 2, enterprise: 3 };
+      const nextPlan =
+        (planRank[milestonePlan] ?? 0) > (planRank[current.plan] ?? 0) ? milestonePlan : current.plan;
+
+      await db.run(
+        `UPDATE users SET verified_referrals = ?, plan = ?, updated_at = ? WHERE telegram_id = ?`,
+        [verified, nextPlan, new Date().toISOString(), tid]
+      );
+      return this.getByTelegramId(tid);
+    },
+
+    async adjustBotSlots(telegramId, bonusSlots) {
+      const parsed = Math.max(-50, Math.min(1000, Math.trunc(Number(bonusSlots) || 0)));
+      await db.run(
+        `UPDATE users SET bonus_bot_slots = ?, updated_at = ? WHERE telegram_id = ?`,
+        [parsed, new Date().toISOString(), String(telegramId)]
+      );
+      return this.getByTelegramId(telegramId);
+    },
+
+    async updateSupportSettings(telegramId, { supportUsername, supportMessage }) {
+      await db.run(
+        `UPDATE users SET support_username = ?, support_message = ?, updated_at = ? WHERE telegram_id = ?`,
+        [String(supportUsername || '').trim(), String(supportMessage || '').trim().slice(0, 500), new Date().toISOString(), String(telegramId)]
+      );
+      return this.getByTelegramId(telegramId);
     },
 
     async setWizardState(telegramId, stateObj) {
@@ -96,15 +166,20 @@ export function createRepositories(db, env) {
       }
       const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
       const { rows } = await db.all(
-        `SELECT u.*, (SELECT COUNT(*) FROM bots b WHERE b.owner_telegram_id = u.telegram_id AND b.status != 'deleted') AS bot_count
+        `SELECT u.*,
+                (SELECT COUNT(*) FROM bots b WHERE b.owner_telegram_id = u.telegram_id AND b.status != 'deleted') AS bot_count,
+                (SELECT COUNT(*) FROM bots b WHERE b.owner_telegram_id = u.telegram_id AND b.status NOT IN ('deleted', 'failed')) AS active_bot_count
          FROM users u ${where}
          ORDER BY u.created_at DESC LIMIT ? OFFSET ?`,
         [...params, limit, offset]
       );
-      return rows;
+      return rows.map((u) => ({
+        ...u,
+        entitlement: calculatePlanEntitlement(u, u.active_bot_count || 0),
+      }));
     },
 
-    async updatePlanAndStatus(telegramId, { plan, status }) {
+    async updatePlanAndStatus(telegramId, { plan, status, bonusBotSlots }) {
       const updates = [];
       const params = [];
       if (plan) {
@@ -114,6 +189,11 @@ export function createRepositories(db, env) {
       if (status) {
         updates.push(`status = ?`);
         params.push(status);
+      }
+      if (bonusBotSlots !== undefined && bonusBotSlots !== null && bonusBotSlots !== '') {
+        const parsed = Math.max(-50, Math.min(1000, Math.trunc(Number(bonusBotSlots) || 0)));
+        updates.push(`bonus_bot_slots = ?`);
+        params.push(parsed);
       }
       if (!updates.length) return null;
       updates.push(`updated_at = ?`);
@@ -126,10 +206,30 @@ export function createRepositories(db, env) {
   const templates = {
     async listActive() {
       const { rows } = await db.all(
-        `SELECT * FROM bot_templates WHERE is_active = 1 ORDER BY sort_order ASC`
+        `SELECT * FROM bot_templates
+         WHERE is_active = 1 AND COALESCE(is_coming_soon, 0) = 0 AND COALESCE(availability_status, 'active') = 'active'
+         ORDER BY sort_order ASC`
       );
       return rows.map((r) => ({
         ...r,
+        is_coming_soon: Boolean(r.is_coming_soon),
+        availability_status: r.availability_status || (r.is_active ? 'active' : 'disabled'),
+        default_config: safeJsonParse(r.default_config, {}),
+      }));
+    },
+
+    async listAllForStudio() {
+      const { rows } = await db.all(
+        `SELECT t.*,
+                (SELECT COUNT(*) FROM bots b WHERE b.template_id = t.id AND b.status != 'deleted') AS bots_created,
+                (SELECT COUNT(*) FROM bots b WHERE b.template_id = t.id AND b.status = 'active') AS active_bots
+         FROM bot_templates t
+         ORDER BY t.sort_order ASC`
+      );
+      return rows.map((r) => ({
+        ...r,
+        is_coming_soon: Boolean(r.is_coming_soon),
+        availability_status: r.availability_status || (r.is_coming_soon ? 'coming_soon' : r.is_active ? 'active' : 'disabled'),
         default_config: safeJsonParse(r.default_config, {}),
       }));
     },
@@ -137,13 +237,44 @@ export function createRepositories(db, env) {
     async getById(id) {
       const { row } = await db.first(`SELECT * FROM bot_templates WHERE id = ?`, [id]);
       if (!row) return null;
-      return { ...row, default_config: safeJsonParse(row.default_config, {}) };
+      return {
+        ...row,
+        is_coming_soon: Boolean(row.is_coming_soon),
+        availability_status: row.availability_status || (row.is_coming_soon ? 'coming_soon' : row.is_active ? 'active' : 'disabled'),
+        default_config: safeJsonParse(row.default_config, {}),
+      };
     },
 
     async getBySlug(slug) {
       const { row } = await db.first(`SELECT * FROM bot_templates WHERE slug = ?`, [slug]);
       if (!row) return null;
-      return { ...row, default_config: safeJsonParse(row.default_config, {}) };
+      return {
+        ...row,
+        is_coming_soon: Boolean(row.is_coming_soon),
+        availability_status: row.availability_status || (row.is_coming_soon ? 'coming_soon' : row.is_active ? 'active' : 'disabled'),
+        default_config: safeJsonParse(row.default_config, {}),
+      };
+    },
+
+    async updateTemplateAdmin(idOrSlug, { availabilityStatus, description, name }) {
+      const existing = (await this.getById(idOrSlug)) || (await this.getBySlug(idOrSlug));
+      if (!existing) throw new Error('Template not found.');
+      if (existing.is_coming_soon && availabilityStatus && availabilityStatus !== 'coming_soon') {
+        throw new Error('Coming Soon templates cannot be enabled until their real backend implementation is released.');
+      }
+
+      const nextStatus = availabilityStatus || existing.availability_status || 'active';
+      const nextIsActive = nextStatus === 'active' && !existing.is_coming_soon ? 1 : 0;
+      const nextDesc = description !== undefined ? String(description).trim() : existing.description;
+      const nextName = name !== undefined ? String(name).trim() : existing.name;
+
+      await db.run(
+        `UPDATE bot_templates
+         SET availability_status = ?, is_active = ?, description = ?, name = ?, updated_at = ?
+         WHERE id = ?`,
+        [nextStatus, nextIsActive, nextDesc, nextName, new Date().toISOString(), existing.id]
+      );
+      return this.getById(existing.id);
     },
   };
 
@@ -765,6 +896,7 @@ export function createRepositories(db, env) {
 
     async getPlatformOverview() {
       const today = new Date().toISOString().slice(0, 10);
+      const todayPrefix = `${today}%`;
       const monthPrefix = `${today.slice(0, 7)}%`;
 
       const [
@@ -775,10 +907,16 @@ export function createRepositories(db, env) {
         txRes,
         logsErrRes,
         dailySeriesRes,
+        refRes,
       ] = await Promise.all([
         db.first(
           `SELECT COUNT(*) AS total_users,
-                  SUM(CASE WHEN plan != 'free' THEN 1 ELSE 0 END) AS premium_users
+                  SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) AS active_users,
+                  SUM(CASE WHEN plan != 'free' THEN 1 ELSE 0 END) AS premium_users,
+                  SUM(CASE WHEN plan = 'free' THEN 1 ELSE 0 END) AS free_users,
+                  SUM(CASE WHEN plan = 'starter' THEN 1 ELSE 0 END) AS starter_users,
+                  SUM(CASE WHEN plan = 'pro' THEN 1 ELSE 0 END) AS pro_users,
+                  SUM(CASE WHEN plan = 'enterprise' THEN 1 ELSE 0 END) AS enterprise_users
            FROM users`
         ),
         db.first(
@@ -786,8 +924,11 @@ export function createRepositories(db, env) {
                   SUM(CASE WHEN status = 'active' AND webhook_status = 'verified' THEN 1 ELSE 0 END) AS active_bots,
                   SUM(CASE WHEN status = 'disabled' THEN 1 ELSE 0 END) AS disabled_bots,
                   SUM(CASE WHEN status = 'failed' OR webhook_status = 'failed' THEN 1 ELSE 0 END) AS failed_deployments,
+                  SUM(CASE WHEN created_at LIKE ? THEN 1 ELSE 0 END) AS bots_today,
+                  SUM(CASE WHEN created_at LIKE ? THEN 1 ELSE 0 END) AS bots_month,
                   COALESCE(SUM(total_updates), 0) AS total_webhook_updates
-           FROM bots WHERE status != 'deleted'`
+           FROM bots WHERE status != 'deleted'`,
+          [todayPrefix, monthPrefix]
         ),
         db.first(
           `SELECT COALESCE(SUM(requests_count), 0) AS requests_today,
@@ -812,6 +953,14 @@ export function createRepositories(db, env) {
            ORDER BY stat_date DESC
            LIMIT 14`
         ),
+        db
+          .first(
+            `SELECT COUNT(*) AS total_referrals,
+                    SUM(CASE WHEN status = 'verified' THEN 1 ELSE 0 END) AS verified_referrals,
+                    SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending_referrals
+             FROM platform_referrals`
+          )
+          .catch(() => ({ row: { total_referrals: 0, verified_referrals: 0, pending_referrals: 0 } })),
       ]);
 
       const reqMonth = Number(monthRes.row?.requests_month || 0);
@@ -819,11 +968,21 @@ export function createRepositories(db, env) {
 
       return {
         totalUsers: Number(usersRes.row?.total_users || 0),
+        activeUsers: Number(usersRes.row?.active_users || 0),
         premiumUsers: Number(usersRes.row?.premium_users || 0),
+        freeUsers: Number(usersRes.row?.free_users || 0),
+        starterUsers: Number(usersRes.row?.starter_users || 0),
+        proUsers: Number(usersRes.row?.pro_users || 0),
+        enterpriseUsers: Number(usersRes.row?.enterprise_users || 0),
+        totalReferrals: Number(refRes.row?.total_referrals || 0),
+        verifiedReferrals: Number(refRes.row?.verified_referrals || 0),
+        pendingReferrals: Number(refRes.row?.pending_referrals || 0),
         totalBots: Number(botsRes.row?.total_bots || 0),
         activeBots: Number(botsRes.row?.active_bots || 0),
         disabledBots: Number(botsRes.row?.disabled_bots || 0),
         failedDeployments: Number(botsRes.row?.failed_deployments || 0),
+        botsCreatedToday: Number(botsRes.row?.bots_today || 0),
+        botsCreatedThisMonth: Number(botsRes.row?.bots_month || 0),
         totalWebhookUpdates: Number(botsRes.row?.total_webhook_updates || 0),
         requestsToday: Number(todayRes.row?.requests_today || 0),
         requestsThisMonth: reqMonth,
@@ -867,7 +1026,368 @@ export function createRepositories(db, env) {
     },
   };
 
-  return { users, templates, bots, botConfigs, menus, endUsers, broadcasts, stats, db };
+  const platformReferrals = {
+    async getByReferred(referredTelegramId) {
+      const { row } = await db.first(
+        `SELECT * FROM platform_referrals WHERE referred_telegram_id = ?`,
+        [String(referredTelegramId)]
+      );
+      return row;
+    },
+
+    async createVerified({ referrerTelegramId, referredTelegramId, reason = '' }) {
+      const id = newId('pref');
+      const now = new Date().toISOString();
+      await db.batch([
+        {
+          sql: `INSERT INTO platform_referrals (id, referrer_telegram_id, referred_telegram_id, status, reason, verified_at, created_at)
+                VALUES (?, ?, ?, 'verified', ?, ?, ?)`,
+          params: [id, String(referrerTelegramId), String(referredTelegramId), reason, now, now],
+        },
+        {
+          sql: `UPDATE users SET referred_by = ?, updated_at = ? WHERE telegram_id = ?`,
+          params: [String(referrerTelegramId), now, String(referredTelegramId)],
+        },
+      ]);
+      const { row } = await db.first(`SELECT * FROM platform_referrals WHERE id = ?`, [id]);
+      return row;
+    },
+
+    async createPending({ referrerTelegramId, referredTelegramId, reason = 'Awaiting review' }) {
+      const id = newId('pref');
+      const now = new Date().toISOString();
+      await db.run(
+        `INSERT INTO platform_referrals (id, referrer_telegram_id, referred_telegram_id, status, reason, created_at)
+         VALUES (?, ?, ?, 'pending', ?, ?)`,
+        [id, String(referrerTelegramId), String(referredTelegramId), reason, now]
+      );
+      const { row } = await db.first(`SELECT * FROM platform_referrals WHERE id = ?`, [id]);
+      return row;
+    },
+
+    async listByReferrer(referrerTelegramId, limit = 50) {
+      const { rows } = await db.all(
+        `SELECT r.*, u.username AS referred_username, u.first_name AS referred_first_name
+         FROM platform_referrals r
+         LEFT JOIN users u ON u.telegram_id = r.referred_telegram_id
+         WHERE r.referrer_telegram_id = ?
+         ORDER BY r.created_at DESC LIMIT ?`,
+        [String(referrerTelegramId), limit]
+      );
+      return rows;
+    },
+
+    async countPendingByReferrer(referrerTelegramId) {
+      const { row } = await db.first(
+        `SELECT COUNT(*) AS cnt FROM platform_referrals WHERE referrer_telegram_id = ? AND status = 'pending'`,
+        [String(referrerTelegramId)]
+      );
+      return Number(row?.cnt || 0);
+    },
+
+    async getSummary(referrerTelegramId) {
+      const tid = String(referrerTelegramId);
+      const [aggRes, recent] = await Promise.all([
+        db.first(
+          `SELECT COUNT(*) AS total,
+                  SUM(CASE WHEN status = 'verified' THEN 1 ELSE 0 END) AS verified,
+                  SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending,
+                  SUM(CASE WHEN status = 'flagged' THEN 1 ELSE 0 END) AS flagged,
+                  SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) AS rejected
+           FROM platform_referrals
+           WHERE referrer_telegram_id = ?`,
+          [tid]
+        ),
+        this.listByReferrer(tid, 10),
+      ]);
+      return {
+        total: Number(aggRes.row?.total || 0),
+        verified: Number(aggRes.row?.verified || 0),
+        pending: Number(aggRes.row?.pending || 0),
+        flagged: Number(aggRes.row?.flagged || 0),
+        rejected: Number(aggRes.row?.rejected || 0),
+        recent,
+      };
+    },
+
+    async listAll({ status = '', limit = 100 } = {}) {
+      const where = status ? `WHERE r.status = ?` : '';
+      const params = status ? [status, limit] : [limit];
+      const { rows } = await db.all(
+        `SELECT r.*,
+                ru.username AS referrer_username, ru.first_name AS referrer_first_name, ru.referral_code AS referral_code,
+                tu.username AS referred_username, tu.first_name AS referred_first_name
+         FROM platform_referrals r
+         LEFT JOIN users ru ON ru.telegram_id = r.referrer_telegram_id
+         LEFT JOIN users tu ON tu.telegram_id = r.referred_telegram_id
+         ${where}
+         ORDER BY r.created_at DESC LIMIT ?`,
+        params
+      );
+      return rows;
+    },
+
+    async updateStatus(referralId, { status, reviewedBy, reason = '' }) {
+      const { row: existing } = await db.first(`SELECT * FROM platform_referrals WHERE id = ?`, [referralId]);
+      if (!existing) throw new Error('Referral record not found.');
+      const now = new Date().toISOString();
+      await db.run(
+        `UPDATE platform_referrals
+         SET status = ?, reviewed_by = ?, reason = COALESCE(NULLIF(?, ''), reason),
+             verified_at = CASE WHEN ? = 'verified' THEN ? ELSE verified_at END
+         WHERE id = ?`,
+        [status, String(reviewedBy), reason, status, now, referralId]
+      );
+      await users.syncReferralMetrics(existing.referrer_telegram_id);
+      const { row: updated } = await db.first(`SELECT * FROM platform_referrals WHERE id = ?`, [referralId]);
+      return updated;
+    },
+  };
+
+  const platformAdmins = {
+    async list() {
+      const { rows } = await db.all(
+        `SELECT pa.*, u.username AS username
+         FROM platform_admins pa
+         LEFT JOIN users u ON u.telegram_id = pa.telegram_id
+         ORDER BY pa.created_at DESC`
+      );
+      return rows.map((r) => ({
+        ...r,
+        status: 'active',
+        permissions: safeJsonParse(r.permissions, []),
+      }));
+    },
+
+    async getByTelegramId(telegramId) {
+      const { row } = await db.first(
+        `SELECT pa.*, u.username AS username
+         FROM platform_admins pa
+         LEFT JOIN users u ON u.telegram_id = pa.telegram_id
+         WHERE pa.telegram_id = ?`,
+        [String(telegramId)]
+      );
+      if (!row) return null;
+      return { ...row, status: 'active', permissions: safeJsonParse(row.permissions, []) };
+    },
+
+    async isAuthorized(telegramId) {
+      if (isOwnerTelegramId(telegramId, env)) return { authorized: true, isSuperAdmin: true, permissions: ['all'] };
+      const record = await this.getByTelegramId(telegramId);
+      if (!record) return { authorized: false, isSuperAdmin: false, permissions: [] };
+      return { authorized: true, isSuperAdmin: false, role: record.role, permissions: record.permissions };
+    },
+
+    async upsert({ telegramId, role = 'admin', permissions = ['overview', 'users', 'bots', 'support', 'logs'], addedBy = 'owner' }) {
+      const tid = String(telegramId).trim();
+      if (!/^\d{4,20}$/.test(tid)) throw new Error('Valid numeric Telegram ID is required.');
+      if (isOwnerTelegramId(tid, env)) {
+        throw new Error('Super Admin permissions are immutable and cannot be modified here.');
+      }
+      const now = new Date().toISOString();
+      const safePerms = Array.isArray(permissions)
+        ? permissions
+        : permissions && typeof permissions === 'object'
+          ? Object.entries(permissions).filter(([, v]) => Boolean(v)).map(([k]) => k)
+          : ['overview', 'users', 'bots', 'support', 'logs'];
+      await db.run(
+        `INSERT INTO platform_admins (id, telegram_id, role, permissions, added_by, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(telegram_id) DO UPDATE SET
+           role = excluded.role,
+           permissions = excluded.permissions,
+           updated_at = excluded.updated_at`,
+        [newId('padm'), tid, role === 'moderator' ? 'moderator' : 'admin', JSON.stringify(safePerms), String(addedBy), now, now]
+      );
+      return this.getByTelegramId(tid);
+    },
+
+    async add(opts) {
+      return this.upsert(opts);
+    },
+
+    async remove(telegramId, actorTelegramId) {
+      const tid = String(telegramId).trim();
+      if (isOwnerTelegramId(tid, env)) {
+        throw new Error('Super Admin cannot be removed or overridden by any admin.');
+      }
+      if (!isOwnerTelegramId(actorTelegramId, env)) {
+        throw new Error('Only Super Admin can remove platform admins.');
+      }
+      await db.run(`DELETE FROM platform_admins WHERE telegram_id = ?`, [tid]);
+      return { removed: true, telegramId: tid };
+    },
+  };
+
+  const VALID_PAYMENT_ORDER_TYPES = new Set([
+    'smm_deposit',
+    'apk_order',
+    'voucher_order',
+    'digital_order',
+    'custom_order',
+  ]);
+
+  const payments = {
+    async createProof({
+      botId,
+      userTelegramId,
+      endUserId,
+      orderType,
+      referenceType,
+      referenceId = null,
+      itemTitle = '',
+      amount = 0,
+      currency = 'INR',
+      paymentMethod = 'upi_manual',
+      utrNumber = '',
+      screenshotFileId = null,
+      proofFileId = null,
+    }) {
+      const id = newId('pay');
+      const now = new Date().toISOString();
+      const resolvedUserId = String(userTelegramId ?? endUserId ?? '');
+      const rawType = String(orderType ?? referenceType ?? 'digital_order').trim();
+      const normalizedType = VALID_PAYMENT_ORDER_TYPES.has(rawType)
+        ? rawType
+        : rawType === 'apk_purchase'
+          ? 'apk_order'
+          : rawType === 'voucher_purchase'
+            ? 'voucher_order'
+            : 'digital_order';
+      const resolvedFileId = screenshotFileId ?? proofFileId ?? null;
+
+      await db.run(
+        `INSERT INTO payment_proofs (
+          id, bot_id, user_telegram_id, order_type, reference_id, item_title,
+          amount, currency, payment_method, utr_number, screenshot_file_id, status, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
+        [
+          id,
+          botId,
+          resolvedUserId,
+          normalizedType,
+          referenceId,
+          String(itemTitle).slice(0, 120),
+          Number(amount || 0),
+          currency,
+          paymentMethod,
+          String(utrNumber || '').trim().slice(0, 64),
+          resolvedFileId,
+          now,
+          now,
+        ]
+      );
+      const { row } = await db.first(`SELECT * FROM payment_proofs WHERE id = ?`, [id]);
+      return row;
+    },
+
+    async getById(botId, proofId) {
+      const { row } = await db.first(
+        `SELECT * FROM payment_proofs WHERE id = ? AND bot_id = ?`,
+        [proofId, botId]
+      );
+      return row;
+    },
+
+    async listPending(botId, limit = 20) {
+      const { rows } = await db.all(
+        `SELECT * FROM payment_proofs WHERE bot_id = ? AND status = 'pending' ORDER BY created_at ASC LIMIT ?`,
+        [botId, limit]
+      );
+      return rows;
+    },
+
+    async listByUser(botId, userTelegramId, limit = 15) {
+      const { rows } = await db.all(
+        `SELECT * FROM payment_proofs WHERE bot_id = ? AND user_telegram_id = ? ORDER BY created_at DESC LIMIT ?`,
+        [botId, String(userTelegramId), limit]
+      );
+      return rows;
+    },
+
+    /**
+     * Atomically transitions a pending payment proof to approved.
+     * Prevents duplicate approvals or double deliveries via conditional WHERE status = 'pending'.
+     */
+    async approveProof(botId, proofId, reviewedBy, reviewNote = 'Verified by admin') {
+      const now = new Date().toISOString();
+      const { meta } = await db.run(
+        `UPDATE payment_proofs
+         SET status = 'approved', reviewed_by = ?, review_note = ?, updated_at = ?
+         WHERE id = ? AND bot_id = ? AND status = 'pending'`,
+        [String(reviewedBy), reviewNote, now, proofId, botId]
+      );
+      if (!meta?.changes) {
+        return { transitioned: false, approved: false, reason: 'Payment proof was already processed or not found.' };
+      }
+      const proof = await this.getById(botId, proofId);
+      return { transitioned: true, approved: true, proof };
+    },
+
+    async rejectProof(botId, proofId, reviewedBy, reviewNote = 'Rejected by admin') {
+      const now = new Date().toISOString();
+      const { meta } = await db.run(
+        `UPDATE payment_proofs
+         SET status = 'rejected', reviewed_by = ?, review_note = ?, updated_at = ?
+         WHERE id = ? AND bot_id = ? AND status = 'pending'`,
+        [String(reviewedBy), reviewNote, now, proofId, botId]
+      );
+      if (!meta?.changes) {
+        return { transitioned: false, rejected: false, reason: 'Payment proof was already processed or not found.' };
+      }
+      const proof = await this.getById(botId, proofId);
+      return { transitioned: true, rejected: true, proof };
+    },
+  };
+
+  const deployments = {
+    async record({ botId = null, ownerTelegramId, templateId = null, stage, status, webhookUrl = null, errorMessage = null }) {
+      try {
+        await db.run(
+          `INSERT INTO deployment_logs (id, bot_id, owner_telegram_id, template_id, stage, status, webhook_url, error_message)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          [newId('dep'), botId, String(ownerTelegramId), templateId, stage, status, webhookUrl, errorMessage]
+        );
+      } catch {
+        // Non-fatal if migration 0003 hasn't been applied on an older environment yet
+      }
+    },
+
+    async listRecent(limit = 50) {
+      try {
+        const { rows } = await db.all(
+          `SELECT d.*, t.slug AS template_slug, t.name AS template_name
+           FROM deployment_logs d
+           LEFT JOIN bot_templates t ON d.template_id = t.id
+           ORDER BY d.created_at DESC LIMIT ?`,
+          [limit]
+        );
+        return rows.map((r) => ({
+          ...r,
+          template_slug: r.template_slug || r.template_id || null,
+          detail: r.error_message || r.webhook_url || r.stage || '',
+        }));
+      } catch {
+        return [];
+      }
+    },
+  };
+
+  return {
+    users,
+    templates,
+    bots,
+    botConfigs,
+    menus,
+    endUsers,
+    broadcasts,
+    stats,
+    platformReferrals,
+    platformAdmins,
+    payments,
+    deployments,
+    db,
+  };
 }
 
 function safeJsonParse(str, fallback) {

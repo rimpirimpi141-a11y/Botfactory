@@ -19,8 +19,10 @@ export interface HealthResponse {
   bindings: {
     d1: {
       healthy: boolean;
+      upgrade0003Applied?: boolean;
       tableCount?: number;
       missingTables?: string[];
+      missingUpgradeTables?: string[];
       seededTemplates?: number;
       latencyMs?: number;
       error?: string;
@@ -109,11 +111,21 @@ export interface MasterWebhookActionResponse {
 
 export interface PlatformOverview {
   totalUsers: number;
+  activeUsers?: number;
   premiumUsers: number;
+  freeUsers?: number;
+  starterUsers?: number;
+  proUsers?: number;
+  enterpriseUsers?: number;
+  totalReferrals?: number;
+  verifiedReferrals?: number;
+  pendingReferrals?: number;
   totalBots: number;
   activeBots: number;
   disabledBots: number;
   failedDeployments: number;
+  botsCreatedToday?: number;
+  botsCreatedThisMonth?: number;
   totalWebhookUpdates: number;
   requestsToday: number;
   requestsThisMonth: number;
@@ -145,6 +157,18 @@ export interface BotRecord {
   total_users: number;
   created_at: string;
   updated_at: string;
+}
+
+export interface TemplateStudioRecord {
+  id: string;
+  slug: string;
+  name: string;
+  category: string;
+  description: string;
+  required_plan: string;
+  is_active: number;
+  is_coming_soon: number;
+  availability_status: 'active' | 'disabled' | 'maintenance' | 'coming_soon' | string;
 }
 
 export interface BuilderButton {
@@ -208,6 +232,40 @@ export interface CloudflareMetricsPayload {
   status: 'connected' | 'unavailable';
   message?: string;
   lastUpdated: string;
+  applicationHealth?: {
+    status: 'healthy' | 'degraded';
+    checkedAt?: string;
+    worker?: {
+      healthy: boolean;
+      scriptName: string;
+      publicUrl: string;
+    };
+    d1: {
+      bound: boolean;
+      healthy: boolean;
+      latencyMs: number | null;
+      tableCount: number | null;
+      seededTemplates?: number;
+      upgrade0003Applied?: boolean;
+      error?: string | null;
+    };
+    kv: {
+      bound: boolean;
+      healthy: boolean;
+      latencyMs: number | null;
+      detail?: string | null;
+      error?: string | null;
+    };
+    analyticsEngine: {
+      bound: boolean;
+      status: string;
+    };
+  };
+  accountMetrics?: {
+    configured: boolean;
+    status: 'connected' | 'not_configured';
+    message: string;
+  };
   applicationCounters: {
     source: string;
     requestsToday: number;
@@ -259,6 +317,20 @@ export interface CloudflareMetricsPayload {
   };
 }
 
+export interface UserEntitlement {
+  plan: string;
+  planLabel: string;
+  verifiedReferrals: number;
+  pendingReferrals: number;
+  bonusBotSlots: number;
+  maxBots: number | null;
+  maxBotsLabel: string;
+  activeBotCount: number;
+  remainingSlots: number | null;
+  isUnlimited: boolean;
+  canCreateBot: boolean;
+}
+
 export interface UserRecord {
   id: string;
   telegram_id: string;
@@ -267,8 +339,47 @@ export interface UserRecord {
   role: string;
   plan: string;
   status: string;
+  referral_code?: string | null;
+  verified_referrals?: number;
+  bonus_bot_slots?: number;
   bot_count: number;
+  entitlement?: UserEntitlement;
   last_active_at: string | null;
+  created_at: string;
+}
+
+export interface PlatformReferralRecord {
+  id: string;
+  referrer_telegram_id: string;
+  referred_telegram_id: string;
+  referral_code: string;
+  status: 'verified' | 'pending' | 'flagged' | 'rejected';
+  rejection_reason?: string | null;
+  referrer_username?: string | null;
+  referred_username?: string | null;
+  created_at: string;
+  verified_at?: string | null;
+}
+
+export interface PlatformAdminRecord {
+  id: string;
+  telegram_id: string;
+  username: string | null;
+  role: 'super_admin' | 'admin';
+  permissions: Record<string, boolean> | string[];
+  status: string;
+  added_by: string | null;
+  created_at: string;
+}
+
+export interface DeploymentLogRecord {
+  id: string;
+  bot_id: string | null;
+  owner_telegram_id: string;
+  template_slug: string | null;
+  stage: string;
+  status: string;
+  detail: string | null;
   created_at: string;
 }
 
@@ -364,6 +475,13 @@ export function createWorkerApi(conn: WorkerConnection) {
         settings: Record<string, string>;
         masterBotDeepLink: string | null;
       }>('/api/dashboard/overview'),
+    getAllTemplates: () =>
+      request<{ ok: boolean; templates: TemplateStudioRecord[] }>('/api/templates/all'),
+    updateTemplate: (id: string, payload: { availabilityStatus?: string; isActive?: boolean; description?: string }) =>
+      request<{ ok: boolean; template: TemplateStudioRecord }>(`/api/templates/${id}`, {
+        method: 'PATCH',
+        body: JSON.stringify(payload),
+      }),
     listBots: (params?: { q?: string; status?: string }) => {
       const qs = new URLSearchParams();
       if (params?.q) qs.set('q', params.q);
@@ -387,6 +505,7 @@ export function createWorkerApi(conn: WorkerConnection) {
       description: string;
       branding: BotBrandingConfig;
       customMenus?: BuilderMenu[];
+      templateConfig?: Record<string, unknown>;
     }) =>
       request<{
         ok: boolean;
@@ -444,11 +563,47 @@ export function createWorkerApi(conn: WorkerConnection) {
       request<{ ok: boolean; metrics: CloudflareMetricsPayload }>('/api/cloudflare/metrics'),
     listUsers: (q = '') =>
       request<{ ok: boolean; users: UserRecord[] }>(`/api/users${q ? `?q=${encodeURIComponent(q)}` : ''}`),
-    updateUser: (telegramId: string, payload: { plan?: string; suspend?: boolean }) =>
+    getUserDetail: (telegramId: string) =>
+      request<{
+        ok: boolean;
+        user: UserRecord;
+        entitlement: UserEntitlement;
+        bots: BotRecord[];
+        referrals: PlatformReferralRecord[];
+        recentActivity: SystemLogRecord[];
+      }>(`/api/users/${encodeURIComponent(telegramId)}`),
+    updateUser: (telegramId: string, payload: { plan?: string; suspend?: boolean; bonusBotSlots?: number }) =>
       request<{ ok: boolean; user: UserRecord }>(`/api/users/${telegramId}`, {
         method: 'PATCH',
         body: JSON.stringify(payload),
       }),
+    listReferrals: (status = '') =>
+      request<{ ok: boolean; referrals: PlatformReferralRecord[] }>(
+        `/api/referrals${status ? `?status=${encodeURIComponent(status)}` : ''}`
+      ),
+    updateReferral: (id: string, payload: { status: 'verified' | 'pending' | 'flagged' | 'rejected'; reason?: string }) =>
+      request<{ ok: boolean; referral: PlatformReferralRecord }>(`/api/referrals/${id}`, {
+        method: 'PATCH',
+        body: JSON.stringify(payload),
+      }),
+    listPlatformAdmins: () =>
+      request<{ ok: boolean; admins: PlatformAdminRecord[] }>('/api/platform-admins'),
+    addPlatformAdmin: (payload: { telegramId: string; username?: string }) =>
+      request<{ ok: boolean; admin: PlatformAdminRecord }>('/api/platform-admins', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      }),
+    removePlatformAdmin: (telegramId: string) =>
+      request<{ ok: boolean; removed: boolean }>(`/api/platform-admins/${telegramId}`, {
+        method: 'DELETE',
+      }),
+    listDeployments: () =>
+      request<{ ok: boolean; deployments: DeploymentLogRecord[] }>('/api/deployments'),
+    verifyForceJoin: (channel: string) =>
+      request<{ ok: boolean; channel: string; botIsAdmin: boolean; status: string; error?: string }>(
+        '/api/force-join/verify',
+        { method: 'POST', body: JSON.stringify({ channel }) }
+      ),
     listLogs: (level = '') =>
       request<{ ok: boolean; logs: SystemLogRecord[] }>(`/api/logs${level ? `?level=${encodeURIComponent(level)}` : ''}`),
     getSettings: () => request<{ ok: boolean; settings: Record<string, string> }>('/api/settings'),

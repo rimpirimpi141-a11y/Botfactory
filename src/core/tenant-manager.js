@@ -17,6 +17,7 @@ import {
 import { buildTenantWebhookUrl, registerAndVerifyWebhook, removeWebhook } from './webhook-manager.js';
 import { validateBotTokenFormat, validateSafeUrl, validateSupportUsername } from '../utils/validation.js';
 import { writeSystemLog } from '../utils/logger.js';
+import { calculatePlanEntitlement } from './plans-referrals.js';
 
 const TENANT_CACHE_TTL_SECONDS = 300; // 5 minutes, invalidated immediately on mutation
 
@@ -171,6 +172,7 @@ export async function deployTenantBot({
   description = '',
   branding = {},
   customMenus = null,
+  templateConfig = null,
   onStage = null,
 }) {
   const notify = async (stage, detail = '') => {
@@ -189,11 +191,20 @@ export async function deployTenantBot({
     allowRetryFailed: true,
   });
 
-  // Stage 2: Check template & owner quotas
-  await notify('load_template', 'Loading template definition...');
+  // Stage 2: Check template availability & owner referral-based bot creation limit
+  await notify('load_template', 'Loading template definition & checking bot slots...');
   const template = (await repos.templates.getById(templateId)) || (await repos.templates.getBySlug(templateId));
   if (!template) {
     throw new Error(`Template "${templateId}" not found.`);
+  }
+  if (template.is_coming_soon || template.availability_status === 'coming_soon') {
+    throw new Error(`Template "${template.name}" is marked Coming Soon and cannot be deployed yet.`);
+  }
+  if (template.availability_status === 'maintenance') {
+    throw new Error(`Template "${template.name}" is temporarily in maintenance mode. Please try another template.`);
+  }
+  if (!template.is_active || template.availability_status === 'disabled') {
+    throw new Error(`Template "${template.name}" is currently disabled by the platform owner.`);
   }
 
   const owner = await repos.users.getByTelegramId(ownerTelegramId);
@@ -204,6 +215,24 @@ export async function deployTenantBot({
   const settings = await repos.stats.getSettings();
   if (settings.map.maintenance_mode === 'true' && owner?.role !== 'super_admin') {
     throw new Error('BOT FACTORY is currently in maintenance mode. Please retry shortly.');
+  }
+
+  // Enforce backend referral-based bot creation slot limits (skipped for safe retry of an existing failed bot)
+  if (!validated.retryBotId) {
+    const activeBotCount = await repos.users.countActiveBots(ownerTelegramId);
+    const entitlement = calculatePlanEntitlement(owner || { plan: 'free' }, activeBotCount);
+    if (!entitlement.canCreateBot) {
+      await repos.deployments.record({
+        ownerTelegramId,
+        templateId: template.id,
+        stage: 'slot_limit_check',
+        status: 'failed',
+        errorMessage: `Bot slot limit reached (${entitlement.usedSlots}/${entitlement.botLimit}).`,
+      });
+      throw new Error(
+        `Bot creation slot limit reached (${entitlement.usedSlots}/${entitlement.botLimit} active bots on ${entitlement.planLabel}). Invite genuine users with your referral link to unlock +1 slot per referral (8 -> STARTER 10, 48 -> PRO 50, 50 -> ENTERPRISE Unlimited).`
+      );
+    }
   }
 
   // Validate optional branding URLs and support handle
@@ -279,6 +308,7 @@ export async function deployTenantBot({
     templateSettings: {
       ...template.default_config,
       ...(branding.templateSettings || {}),
+      ...(templateConfig && typeof templateConfig === 'object' ? templateConfig : {}),
     },
     forceJoinChannels: branding.forceJoinChannels || [],
     promoFooterEnabled: branding.promoFooterEnabled !== false,
@@ -307,6 +337,14 @@ export async function deployTenantBot({
     });
 
     await invalidateTenantCache(env, botId);
+    await repos.deployments.record({
+      botId,
+      ownerTelegramId,
+      templateId: template.id,
+      stage: 'verify_webhook',
+      status: validated.retryBotId ? 'retried' : 'succeeded',
+      webhookUrl: verification.webhookUrl,
+    });
     await writeSystemLog(env, {
       level: 'audit',
       source: 'tenant-manager',
@@ -329,6 +367,15 @@ export async function deployTenantBot({
       error: webhookErr?.message || 'Webhook registration failed',
     });
     await invalidateTenantCache(env, botId);
+    await repos.deployments.record({
+      botId,
+      ownerTelegramId,
+      templateId: template.id,
+      stage: 'register_webhook',
+      status: 'failed',
+      webhookUrl,
+      errorMessage: webhookErr?.message || 'Webhook registration failed',
+    });
     await writeSystemLog(env, {
       level: 'error',
       source: 'tenant-manager',

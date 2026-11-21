@@ -21,13 +21,27 @@ import {
 } from '../../utils/keyboards.js';
 import { newId } from '../../database/repositories.js';
 import { escapeHtml } from '../../utils/validation.js';
+import {
+  ADMIN_COMMON_LABELS,
+  buildCancelReplyKeyboard,
+  buildTenantAdminReplyKeyboard,
+  handleCommonTenantAdmin,
+} from '../shared/tenant-admin.js';
+import { invalidateTenantCache } from '../../core/tenant-manager.js';
 
 export const REFER_EARN_META = {
   id: 'tpl_refer_earn',
   slug: 'refer-earn',
-  name: 'Refer & Earn Bot',
+  name: 'Refer & Earn Cash Bot',
   category: 'Growth & Rewards',
 };
+
+const ADMIN_EXTRA_BUTTONS = [
+  { text: '💸 Manage Withdrawals', style: BUTTON_STYLES.DANGER },
+  { text: '🎟 Create Giftcode', style: BUTTON_STYLES.SUCCESS },
+  { text: '🎁 Bonus & Referral Rules', style: BUTTON_STYLES.PRIMARY },
+  { text: '💰 Adjust User Balance', style: BUTTON_STYLES.SUCCESS },
+];
 
 function buildUserKeyboard(isAdmin = false) {
   const rows = [
@@ -45,39 +59,18 @@ function buildUserKeyboard(isAdmin = false) {
     ],
     [
       { text: '🏆 Leaderboard', style: BUTTON_STYLES.PRIMARY },
-      { text: '📢 Join Channels', style: BUTTON_STYLES.DEFAULT },
+      { text: '📢 Join Channels', style: BUTTON_STYLES.SUCCESS },
     ],
-    [{ text: '❓ Help', style: BUTTON_STYLES.DEFAULT }],
+    [{ text: '❓ Help', style: BUTTON_STYLES.PRIMARY }],
   ];
   if (isAdmin) {
-    rows.push([{ text: '🛡 Admin Dashboard', style: BUTTON_STYLES.DANGER }]);
+    rows.push([{ text: ADMIN_COMMON_LABELS.OPEN_ADMIN, style: BUTTON_STYLES.DANGER }]);
   }
   return buildReplyKeyboard(rows, { resize: true, persistent: true });
 }
 
 function buildAdminKeyboard() {
-  return buildInlineKeyboard([
-    [
-      inlineButton({ text: '📊 Dashboard', callbackData: 're:adm:dash', style: BUTTON_STYLES.PRIMARY }),
-      inlineButton({ text: '👥 Manage Users', callbackData: 're:adm:users', style: BUTTON_STYLES.PRIMARY }),
-    ],
-    [
-      inlineButton({ text: '🎟 Create Giftcode', callbackData: 're:adm:new_gift', style: BUTTON_STYLES.SUCCESS }),
-      inlineButton({ text: '💸 Manage Withdrawals', callbackData: 're:adm:withdrawals', style: BUTTON_STYLES.DANGER }),
-    ],
-    [
-      inlineButton({ text: '🎁 Daily Bonus Settings', callbackData: 're:adm:set_daily', style: BUTTON_STYLES.PRIMARY }),
-      inlineButton({ text: '👥 Referral Settings', callbackData: 're:adm:set_ref', style: BUTTON_STYLES.PRIMARY }),
-    ],
-    [
-      inlineButton({ text: '💰 Manage Points', callbackData: 're:adm:points', style: BUTTON_STYLES.SUCCESS }),
-      inlineButton({ text: '📢 Manage Channels', callbackData: 're:adm:channels', style: BUTTON_STYLES.PRIMARY }),
-    ],
-    [
-      inlineButton({ text: '📈 Bot Statistics', callbackData: 're:adm:stats', style: BUTTON_STYLES.PRIMARY }),
-      inlineButton({ text: '⚙️ Bot Settings', callbackData: 're:adm:settings', style: BUTTON_STYLES.DEFAULT }),
-    ],
-  ]);
+  return buildTenantAdminReplyKeyboard(ADMIN_EXTRA_BUTTONS);
 }
 
 async function checkForceJoin({ telegram, token, channels = [], userId }) {
@@ -119,6 +112,84 @@ export async function handleReferEarnUpdate(ctx) {
   const chatId = msg.chat.id;
   const text = (msg.text || '').trim();
   const userState = endUser.state_json ? safeParse(endUser.state_json) : null;
+  const userKb = buildUserKeyboard(isAdmin);
+  const adminKb = buildAdminKeyboard();
+
+  // Native ReplyKeyboard Common Tenant Admin Panel
+  const handledCommon = await handleCommonTenantAdmin(ctx, {
+    panelTitle: 'Refer & Earn Admin Panel',
+    extraButtons: ADMIN_EXTRA_BUTTONS,
+    userKeyboard: userKb,
+    extraStatsSummary: async () => {
+      const { row } = await repos.db.first(
+        `SELECT COUNT(*) AS pending FROM withdrawal_requests WHERE bot_id = ? AND status = 'pending'`,
+        [bot.id]
+      );
+      return `• Pending Payout Requests: <b>${Number(row?.pending || 0)}</b>`;
+    },
+  });
+  if (handledCommon) return;
+
+  // Template-specific Admin ReplyKeyboard shortcuts
+  if (isAdmin && text === '💸 Manage Withdrawals') {
+    const { rows } = await repos.db.all(
+      `SELECT * FROM withdrawal_requests WHERE bot_id = ? AND status = 'pending' ORDER BY created_at ASC LIMIT 8`,
+      [bot.id]
+    );
+    if (!rows.length) {
+      await telegram.sendMessage(token, chatId, '✅ No pending withdrawal requests.', { reply_markup: adminKb });
+      return;
+    }
+    for (const w of rows) {
+      await telegram.sendMessage(
+        token,
+        chatId,
+        `💸 <b>Withdrawal</b> <code>${w.id}</code>\nUser: <code>${w.user_telegram_id}</code>\nAmount: <b>${w.amount} ${escapeHtml(settings.currencyLabel)}</b>\nDestination: <code>${escapeHtml(w.payout_details)}</code>`,
+        {
+          reply_markup: buildApprovalButtons(
+            `re:wdr:approve:${w.id}`,
+            `re:wdr:reject:${w.id}`,
+            '✅ Approve Payout',
+            '❌ Reject & Refund'
+          ),
+        }
+      );
+    }
+    return;
+  }
+
+  if (isAdmin && text === '🎟 Create Giftcode') {
+    await repos.endUsers.setState(bot.id, endUser.telegram_id, { step: 'adm_create_giftcode' });
+    await telegram.sendMessage(
+      token,
+      chatId,
+      '🎟 Send giftcode details:\n<code>CODE | RewardAmount | MaxUses | OptionalExpiry(YYYY-MM-DD or days)</code>',
+      { reply_markup: buildCancelReplyKeyboard() }
+    );
+    return;
+  }
+
+  if (isAdmin && text === '🎁 Bonus & Referral Rules') {
+    await repos.endUsers.setState(bot.id, endUser.telegram_id, { step: 'adm_set_daily' });
+    await telegram.sendMessage(
+      token,
+      chatId,
+      `<b>🎁 Bonus & Referral Settings</b>\n• Daily Bonus: <b>${settings.dailyBonus}</b> every <b>${settings.dailyBonusCooldownHours}h</b>\n• Referral Reward: <b>${settings.referralReward}</b>\n• Min Withdrawal: <b>${settings.minWithdrawalPoints}</b>\n\nSend <code>DailyBonus | CooldownHours</code> (or just a number for Daily Bonus):`,
+      { reply_markup: buildCancelReplyKeyboard() }
+    );
+    return;
+  }
+
+  if (isAdmin && text === '💰 Adjust User Balance') {
+    await repos.endUsers.setState(bot.id, endUser.telegram_id, { step: 'adm_adjust_points' });
+    await telegram.sendMessage(
+      token,
+      chatId,
+      '💰 Send: <code>USER_TELEGRAM_ID | +/-AMOUNT | Optional Reason</code>',
+      { reply_markup: buildCancelReplyKeyboard() }
+    );
+    return;
+  }
 
   // Handle /start with optional referral deep link
   if (text === '/start' || text.startsWith('/start ')) {
@@ -549,19 +620,32 @@ async function handleStatefulInput(ctx, settings, state, text) {
   }
 
   // Admin creation flows
-  if (isAdmin && state.step === 'adm_create_giftcode') {
+  if (isAdmin && (state.step === 'adm_create_giftcode' || state.step === 'adm_new_gift')) {
     await repos.endUsers.setState(bot.id, endUser.telegram_id, null);
-    // Format: CODE POINTS MAX_USES [EXPIRY_DAYS]
-    const parts = text.split(/\s+/);
+    const adminKb = buildTenantAdminReplyKeyboard(ADMIN_EXTRA_BUTTONS);
+    const parts = text.includes('|') ? text.split('|').map((s) => s.trim()) : text.split(/\s+/);
     const code = (parts[0] || '').toUpperCase().replace(/[^A-Z0-9_-]/g, '');
     const rewardPoints = Number(parts[1]);
     const maxUses = Number(parts[2] || 10);
-    const expiryDays = Number(parts[3] || 30);
+    const expiryRaw = parts[3] || '';
     if (!code || !Number.isFinite(rewardPoints) || rewardPoints <= 0 || !Number.isFinite(maxUses) || maxUses < 1) {
-      await telegram.sendMessage(token, chatId, '❌ Invalid format. Use: <code>CODE POINTS MAX_USES [DAYS]</code> (e.g. <code>LAUNCH50 50 100 14</code>)');
+      await telegram.sendMessage(
+        token,
+        chatId,
+        '❌ Invalid format. Use: <code>CODE | RewardAmount | MaxUses | OptionalExpiry</code> (e.g. <code>LAUNCH50 | 50 | 100 | 14</code>)',
+        { reply_markup: adminKb }
+      );
       return true;
     }
-    const expiresAt = new Date(Date.now() + expiryDays * 86400000).toISOString();
+    let expiresAt = new Date(Date.now() + 30 * 86400000).toISOString();
+    if (expiryRaw) {
+      if (/^\d{4}-\d{2}-\d{2}/.test(expiryRaw)) {
+        const d = new Date(expiryRaw);
+        if (!Number.isNaN(d.getTime())) expiresAt = d.toISOString();
+      } else if (Number.isFinite(Number(expiryRaw)) && Number(expiryRaw) > 0) {
+        expiresAt = new Date(Date.now() + Number(expiryRaw) * 86400000).toISOString();
+      }
+    }
     await repos.db.run(
       `INSERT INTO giftcodes (id, bot_id, code, reward_points, max_uses, expires_at, created_by)
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
@@ -570,55 +654,85 @@ async function handleStatefulInput(ctx, settings, state, text) {
     await telegram.sendMessage(
       token,
       chatId,
-      `✅ <b>Giftcode Created</b>\nCode: <code>${code}</code>\nReward: <b>${rewardPoints}</b> pts\nMax Uses: <b>${Math.floor(maxUses)}</b>\nExpires: ${expiresAt.slice(0, 10)}`
+      `✅ <b>Giftcode Created</b>\nCode: <code>${code}</code>\nReward: <b>${rewardPoints}</b> pts\nMax Uses: <b>${Math.floor(maxUses)}</b>\nExpires: ${expiresAt.slice(0, 10)}`,
+      { reply_markup: adminKb }
     );
     return true;
   }
 
-  if (isAdmin && state.step === 'adm_adjust_points') {
+  if (isAdmin && (state.step === 'adm_adjust_points' || state.step === 'adm_points')) {
     await repos.endUsers.setState(bot.id, endUser.telegram_id, null);
-    const [targetUserId, deltaStr] = text.split(/\s+/);
-    const delta = Number(deltaStr);
+    const adminKb = buildTenantAdminReplyKeyboard(ADMIN_EXTRA_BUTTONS);
+    const parts = text.includes('|') ? text.split('|').map((s) => s.trim()) : text.split(/\s+/);
+    const targetUserId = parts[0] || '';
+    const delta = Number(parts[1]);
+    const reason = parts.slice(2).join(' ').trim();
     if (!targetUserId || !Number.isFinite(delta) || delta === 0) {
-      await telegram.sendMessage(token, chatId, '❌ Format: <code>USER_TELEGRAM_ID DELTA</code> (e.g. <code>123456789 50</code> or <code>123456789 -20</code>)');
+      await telegram.sendMessage(
+        token,
+        chatId,
+        '❌ Format: <code>USER_TELEGRAM_ID | +/-AMOUNT | Reason</code> (e.g. <code>123456789 | 50 | Bonus</code>)',
+        { reply_markup: adminKb }
+      );
       return true;
     }
     try {
       const next = await repos.endUsers.adjustPoints(bot.id, targetUserId, {
         delta,
         txType: delta > 0 ? 'admin_credit' : 'admin_debit',
-        description: `Adjusted by admin ${endUser.telegram_id}`,
+        description: reason || `Adjusted by admin ${endUser.telegram_id}`,
       });
-      await telegram.sendMessage(token, chatId, `✅ User <code>${escapeHtml(targetUserId)}</code> balance updated to <b>${next}</b>.`);
+      await telegram.sendMessage(
+        token,
+        chatId,
+        `✅ User <code>${escapeHtml(targetUserId)}</code> balance updated to <b>${next}</b>.`,
+        { reply_markup: adminKb }
+      );
     } catch (err) {
-      await telegram.sendMessage(token, chatId, `❌ ${escapeHtml(err.message)}`);
+      await telegram.sendMessage(token, chatId, `❌ ${escapeHtml(err.message)}`, { reply_markup: adminKb });
     }
     return true;
   }
 
   if (isAdmin && state.step === 'adm_set_channels') {
     await repos.endUsers.setState(bot.id, endUser.telegram_id, null);
+    const adminKb = buildTenantAdminReplyKeyboard(ADMIN_EXTRA_BUTTONS);
     const channels = text.toLowerCase() === 'clear'
       ? []
       : text.split(/[\s,]+/).map((s) => s.trim()).filter((s) => s.startsWith('@'));
     await repos.botConfigs.upsert(bot.id, { ...config, forceJoinChannels: channels });
-    await telegram.sendMessage(token, chatId, `✅ Force-join channels updated: ${channels.length ? channels.join(', ') : 'None'}`);
+    await invalidateTenantCache(ctx.env, bot.id);
+    await telegram.sendMessage(token, chatId, `✅ Force-join channels updated: ${channels.length ? channels.join(', ') : 'None'}`, {
+      reply_markup: adminKb,
+    });
     return true;
   }
 
   if (isAdmin && (state.step === 'adm_set_daily' || state.step === 'adm_set_ref')) {
     await repos.endUsers.setState(bot.id, endUser.telegram_id, null);
-    const val = Number(text);
-    if (!Number.isFinite(val) || val < 0) {
-      await telegram.sendMessage(token, chatId, '❌ Enter a valid non-negative number.');
+    const adminKb = buildTenantAdminReplyKeyboard(ADMIN_EXTRA_BUTTONS);
+    const parts = text.includes('|') ? text.split('|').map((s) => s.trim()) : [text.trim()];
+    const val = Number(parts[0]);
+    const cooldown = parts[1] !== undefined ? Number(parts[1]) : null;
+    if (!Number.isFinite(val) || val < 0 || (cooldown !== null && (!Number.isFinite(cooldown) || cooldown < 1))) {
+      await telegram.sendMessage(token, chatId, '❌ Enter a valid non-negative number (or <code>DailyBonus | CooldownHours</code>).', {
+        reply_markup: adminKb,
+      });
       return true;
     }
     const nextSettings = {
       ...(config.templateSettings || {}),
       [state.step === 'adm_set_daily' ? 'dailyBonus' : 'referralReward']: val,
+      ...(state.step === 'adm_set_daily' && cooldown !== null ? { dailyBonusCooldownHours: cooldown } : {}),
     };
     await repos.botConfigs.upsert(bot.id, { ...config, templateSettings: nextSettings });
-    await telegram.sendMessage(token, chatId, `✅ Reward setting updated to <b>${val}</b>.`);
+    await invalidateTenantCache(ctx.env, bot.id);
+    await telegram.sendMessage(
+      token,
+      chatId,
+      `✅ Reward setting updated to <b>${val}</b>${cooldown !== null ? ` (cooldown: <b>${cooldown}h</b>)` : ''}.`,
+      { reply_markup: adminKb }
+    );
     return true;
   }
 
@@ -747,8 +861,13 @@ async function handleCallback(ctx, settings) {
     return;
   }
 
-  if (data.startsWith('re:wdr:approve:') || data.startsWith('re:wdr:reject:')) {
-    const isApprove = data.startsWith('re:wdr:approve:');
+  if (
+    data.startsWith('re:wdr:approve:') ||
+    data.startsWith('re:wdr:reject:') ||
+    data.startsWith('re:wd:approve:') ||
+    data.startsWith('re:wd:reject:')
+  ) {
+    const isApprove = data.includes(':approve:');
     const reqId = data.split(':')[3];
     const { row: w } = await repos.db.first(
       `SELECT * FROM withdrawal_requests WHERE id = ? AND bot_id = ?`,

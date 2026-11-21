@@ -21,8 +21,20 @@ import {
 import { createDefaultCustomMenuTree } from '../builder/menu-builder.js';
 import { formatBrandedMessage, listThemePresets } from '../builder/theme-engine.js';
 import { buildMenuRenderPayload } from '../builder/preview.js';
-import { handleOwnerCallback, renderOwnerControlCenter } from '../admin/owner-panel.js';
+import {
+  checkOwnerAuthorization,
+  handleOwnerCallback,
+  handleOwnerMessage,
+  isOwnerMenuButton,
+  renderOwnerControlCenter,
+} from '../admin/owner-panel.js';
 import { composeBroadcastPayload } from '../admin/broadcast.js';
+import {
+  attributePlatformReferral,
+  buildMasterReferralLink,
+  calculatePlanEntitlement,
+  getPlanCatalog,
+} from './plans-referrals.js';
 import {
   buildBotLiveActionKeyboard,
   formatBotLiveSuccessCard,
@@ -32,12 +44,12 @@ import {
 import {
   buildConfirmCancelKeyboard,
   buildInlineKeyboard,
-  buildMasterMainInlineKeyboard,
   buildMasterMainReplyKeyboard,
   BUTTON_STYLES,
   inlineButton,
+  MASTER_MAIN_BUTTONS,
 } from '../utils/keyboards.js';
-import { escapeHtml, isOwnerTelegramId, validateSafeUrl, validateSupportUsername } from '../utils/validation.js';
+import { escapeHtml, validateSafeUrl, validateSupportUsername } from '../utils/validation.js';
 import { isDuplicateWebhookUpdate } from '../utils/rate-limiter.js';
 
 export async function handleMasterBotUpdate({ env, repos, telegram, update }) {
@@ -55,7 +67,8 @@ export async function handleMasterBotUpdate({ env, repos, telegram, update }) {
 
   const user = await repos.users.upsertFromTelegram(tgUser);
   const telegramId = String(tgUser.id);
-  const isOwner = isOwnerTelegramId(telegramId, env);
+  const ownerAuth = await checkOwnerAuthorization(repos, env, telegramId);
+  const isOwner = ownerAuth.authorized;
 
   if (user.status === 'suspended' || user.status === 'banned') {
     const chatId = update?.message?.chat?.id || update?.callback_query?.message?.chat?.id;
@@ -76,22 +89,29 @@ export async function handleMasterBotUpdate({ env, repos, telegram, update }) {
   return { ok: true };
 }
 
-async function sendMasterHome({ telegram, token, chatId, user, isOwner }) {
+async function sendMasterHome({ repos, telegram, token, chatId, user, isOwner, referralNotice = '' }) {
+  const activeBots = await repos.users.countActiveBots(user.telegram_id);
+  const ent = calculatePlanEntitlement(user, activeBots);
+  const slotsLabel = ent.isUnlimited ? `${ent.usedSlots} / Unlimited` : `${ent.usedSlots} / ${ent.botLimit}`;
+
   const welcome = [
     '<pre>╔══════════════════════════╗\n🏭 BOT FACTORY\nBuild. Customize. Deploy.\n╚══════════════════════════╝</pre>',
     '',
     `Welcome, <b>${escapeHtml(user.first_name || user.username || 'Builder')}</b>!`,
-    'Launch production multi-tenant Telegram bots on Cloudflare Workers with automatic webhook verification and colourful native buttons.',
+    'Build, customize, and deploy production multi-tenant Telegram bots on Cloudflare Workers with automatic webhook verification and colourful native keyboards.',
+    referralNotice ? `\n${referralNotice}` : '',
     '',
-    `• <b>Plan:</b> ${String(user.plan || 'free').toUpperCase()}`,
+    `• <b>Plan:</b> ${ent.planLabel} · <b>Bot Slots:</b> ${slotsLabel}`,
+    `• <b>Verified Referrals:</b> ${ent.verifiedReferrals}`,
     `• <b>Account ID:</b> <code>${escapeHtml(user.telegram_id)}</code>`,
-  ].join('\n');
+    '',
+    '<i>Select any option from the colourful keyboard below.</i>',
+  ]
+    .filter((line) => line !== '')
+    .join('\n');
 
   await telegram.sendMessage(token, chatId, welcome, {
     reply_markup: buildMasterMainReplyKeyboard(isOwner),
-  });
-  await telegram.sendMessage(token, chatId, 'Choose a quick action below:', {
-    reply_markup: buildMasterMainInlineKeyboard(isOwner),
   });
 }
 
@@ -102,7 +122,7 @@ async function handleMasterMessage({ env, repos, telegram, token, msg, user, isO
 
   if (text === '/cancel') {
     await repos.users.setWizardState(telegramId, null);
-    await telegram.sendMessage(token, chatId, '✖️ Current wizard cancelled.', {
+    await telegram.sendMessage(token, chatId, '✖️ Current action cancelled.', {
       reply_markup: buildMasterMainReplyKeyboard(isOwner),
     });
     return { ok: true };
@@ -110,73 +130,107 @@ async function handleMasterMessage({ env, repos, telegram, token, msg, user, isO
 
   if (text === '/start' || text.startsWith('/start ')) {
     await repos.users.setWizardState(telegramId, null);
-    if (text === '/start create') {
-      await startCreateBotWizard({ repos, telegram, token, chatId, telegramId });
+    const startArg = text.split(/\s+/)[1] || '';
+
+    let referralNotice = '';
+    if (startArg.startsWith('ref_')) {
+      const refCode = startArg.slice(4);
+      const refRes = await attributePlatformReferral({
+        repos,
+        rawReferralCode: refCode,
+        referredTgUser: msg.from,
+        isNewUser: Boolean(user._isNewUser),
+      });
+      if (refRes.attributed) {
+        referralNotice = '🎉 Referral verified! Your inviter earned +1 active bot creation slot.';
+        const slotsText = refRes.entitlement.isUnlimited ? 'Unlimited' : String(refRes.entitlement.botLimit);
+        await telegram
+          .sendMessage(
+            token,
+            refRes.referrer.telegram_id,
+            `🎉 <b>New Genuine Platform Referral!</b>\nVerified Referrals: <b>${refRes.entitlement.verifiedReferrals}</b>\nCurrent Plan: <b>${refRes.entitlement.planLabel}</b>\nActive Bot Slots: <b>${slotsText}</b>`
+          )
+          .catch(() => {});
+      }
+    }
+
+    if (startArg === 'create') {
+      await startCreateBotWizard({ env, repos, telegram, token, chatId, telegramId, user });
       return { ok: true };
     }
-    await sendMasterHome({ telegram, token, chatId, user, isOwner });
+    await sendMasterHome({ repos, telegram, token, chatId, user, isOwner, referralNotice });
     return { ok: true };
   }
 
-  // Handle active wizard input first
   const wizard = await repos.users.getWizardState(telegramId);
+
+  // Route Owner Control Center 12-button native ReplyKeyboard & stateful owner inputs first
+  if (isOwner && (isOwnerMenuButton(text) || wizard?.flow === 'owner_panel')) {
+    const handled = await handleOwnerMessage({ env, repos, telegram, token, msg, user, wizard });
+    if (handled) return { ok: true };
+  }
+
+  // Handle active Bot Creation / Add Support / Broadcast wizard input
   if (wizard && !text.startsWith('/') && !isMainMenuButton(text)) {
     return handleWizardTextStep({ env, repos, telegram, token, chatId, telegramId, text, wizard, isOwner });
   }
 
   switch (text) {
-    case '🤖 Create New Bot':
-      await startCreateBotWizard({ repos, telegram, token, chatId, telegramId });
+    case MASTER_MAIN_BUTTONS.CREATE_BOT:
+      await startCreateBotWizard({ env, repos, telegram, token, chatId, telegramId, user });
       return { ok: true };
 
-    case '📂 My Created Bots':
+    case MASTER_MAIN_BUTTONS.MY_BOTS:
       await showUserBots({ repos, telegram, token, chatId, telegramId });
       return { ok: true };
 
+    case MASTER_MAIN_BUTTONS.TEMPLATE_STUDIO:
     case '🎨 Theme Studio':
-      await showThemeStudio({ telegram, token, chatId });
+      await showTemplateStudio({ repos, telegram, token, chatId });
       return { ok: true };
 
+    case MASTER_MAIN_BUTTONS.CUSTOM_BUILDER:
     case '🧩 Custom Bot Builder':
-      await startCreateBotWizard({ repos, telegram, token, chatId, telegramId, forceCustom: true });
+      await startCreateBotWizard({ env, repos, telegram, token, chatId, telegramId, user, forceCustom: true });
       return { ok: true };
 
-    case '📊 My Statistics':
-      await showCreatorStatistics({ repos, telegram, token, chatId, telegramId });
+    case MASTER_MAIN_BUTTONS.MY_STATS:
+      await showCreatorStatistics({ repos, telegram, token, chatId, telegramId, user });
       return { ok: true };
 
-    case '💎 Plans & Features':
-      await showPlansAndFeatures({ telegram, token, chatId, user });
+    case MASTER_MAIN_BUTTONS.PLANS_FEATURES:
+      await showPlansAndFeatures({ env, repos, telegram, token, chatId, user });
       return { ok: true };
 
-    case '📢 Help & Support':
+    case MASTER_MAIN_BUTTONS.ACCOUNT_SETTINGS:
+      await showAccountSettings({ repos, telegram, token, chatId, user, isOwner });
+      return { ok: true };
+
+    case MASTER_MAIN_BUTTONS.ADD_SUPPORT:
+      await repos.users.setWizardState(telegramId, { flow: 'add_support', step: 'await_input' });
       await telegram.sendMessage(
         token,
         chatId,
-        [
-          '<b>📢 BOT FACTORY — Help & Support</b>',
-          '',
-          '1. Tap <b>🤖 Create New Bot</b> and pick a Prebuilt Template or the Custom Bot Builder.',
-          '2. Create a bot token from official <b>@BotFather</b> using <code>/newbot</code>.',
-          '3. Paste the token securely — BOT FACTORY validates it via Telegram <code>getMe</code>, encrypts it with AES-256-GCM, and never displays it again.',
-          '4. Customize branding & theme, preview your menu, and deploy automatically with verified webhooks.',
-          '',
-          'Commands: <code>/start</code> · <code>/cancel</code>',
-        ].join('\n')
+        `<b>📢 Add Default Support Contact</b>\nCurrent Handle: <b>${escapeHtml(user.support_username || 'Not set')}</b>\n\nSend: <code>@YourSupportHandle | Optional support message</code>\nSend /cancel to abort.`
       );
       return { ok: true };
 
-    case '👑 Owner Control Center':
+    case MASTER_MAIN_BUTTONS.HELP_SUPPORT:
+    case '📢 Help & Support':
+      await showHelpAndSupport({ repos, telegram, token, chatId, isOwner });
+      return { ok: true };
+
+    case MASTER_MAIN_BUTTONS.OWNER_CENTER:
     case '/owner':
       if (!isOwner) {
-        await telegram.sendMessage(token, chatId, '🔒 Restricted to the BOT FACTORY platform owner.');
+        await telegram.sendMessage(token, chatId, '🔒 Restricted to BOT FACTORY platform administrators.');
         return { ok: true };
       }
       await renderOwnerControlCenter({ env, repos, telegram, token, chatId });
       return { ok: true };
 
     default:
-      await sendMasterHome({ telegram, token, chatId, user, isOwner });
+      await sendMasterHome({ repos, telegram, token, chatId, user, isOwner });
       return { ok: true };
   }
 }
@@ -194,12 +248,12 @@ async function handleMasterCallback({ env, repos, telegram, token, cb, user, isO
 
   if (data === 'mb:home') {
     await repos.users.setWizardState(telegramId, null);
-    await sendMasterHome({ telegram, token, chatId, user, isOwner });
+    await sendMasterHome({ repos, telegram, token, chatId, user, isOwner });
     return { ok: true };
   }
 
   if (data === 'mb:create') {
-    await startCreateBotWizard({ repos, telegram, token, chatId, telegramId });
+    await startCreateBotWizard({ env, repos, telegram, token, chatId, telegramId, user });
     return { ok: true };
   }
 
@@ -208,52 +262,91 @@ async function handleMasterCallback({ env, repos, telegram, token, cb, user, isO
     return { ok: true };
   }
 
-  if (data === 'mb:theme_studio') {
-    await showThemeStudio({ telegram, token, chatId });
+  if (data === 'mb:template_studio' || data === 'mb:theme_studio') {
+    await showTemplateStudio({ repos, telegram, token, chatId });
     return { ok: true };
   }
 
   if (data === 'mb:builder') {
-    await startCreateBotWizard({ repos, telegram, token, chatId, telegramId, forceCustom: true });
+    await startCreateBotWizard({ env, repos, telegram, token, chatId, telegramId, user, forceCustom: true });
     return { ok: true };
   }
 
   if (data === 'mb:stats') {
-    await showCreatorStatistics({ repos, telegram, token, chatId, telegramId });
+    await showCreatorStatistics({ repos, telegram, token, chatId, telegramId, user });
     return { ok: true };
   }
 
   if (data === 'mb:plans') {
-    await showPlansAndFeatures({ telegram, token, chatId, user });
+    await showPlansAndFeatures({ env, repos, telegram, token, chatId, user });
+    return { ok: true };
+  }
+
+  if (data === 'mb:settings') {
+    await showAccountSettings({ repos, telegram, token, chatId, user, isOwner });
+    return { ok: true };
+  }
+
+  if (data === 'mb:add_support') {
+    await repos.users.setWizardState(telegramId, { flow: 'add_support', step: 'await_input' });
+    await telegram.sendMessage(token, chatId, 'Send: <code>@YourSupportHandle | Optional support message</code>');
     return { ok: true };
   }
 
   if (data === 'mb:help') {
+    await showHelpAndSupport({ repos, telegram, token, chatId, isOwner });
+    return { ok: true };
+  }
+
+  if (data.startsWith('mb:coming_soon:')) {
     await telegram.sendMessage(
       token,
       chatId,
-      'Use <b>🤖 Create New Bot</b> to launch a verified bot in seconds. Send /cancel anytime to exit a wizard.'
+      '🕒 <b>Coming Soon</b>\nThis template is currently under active development and cannot be deployed yet. Choose any of the 11 functional templates in Template Studio!'
     );
+    return { ok: true };
+  }
+
+  if (data === 'mb:force_join_recheck') {
+    await startCreateBotWizard({ env, repos, telegram, token, chatId, telegramId, user });
     return { ok: true };
   }
 
   // Wizard Step 2: Prebuilt vs Custom Builder
   if (data === 'wiz:mode:template') {
-    const templates = (await repos.templates.listActive()).filter((t) => t.slug !== 'custom-builder');
-    const rows = templates.map((t) => [
-      inlineButton({
-        text: `📦 ${t.name}`,
-        callbackData: `wiz:tpl:${t.slug}`,
-        style: BUTTON_STYLES.PRIMARY,
-      }),
-    ]);
+    const allTemplates = await repos.templates.listAllForStudio();
+    const functional = allTemplates.filter(
+      (t) => t.slug !== 'custom-builder' && Number(t.is_active) === 1 && Number(t.is_coming_soon) !== 1 && t.availability_status === 'active'
+    );
+    const comingSoon = allTemplates.filter((t) => Number(t.is_coming_soon) === 1 || t.availability_status === 'coming_soon');
+
+    const rows = [];
+    for (let i = 0; i < functional.length; i += 2) {
+      const pair = functional.slice(i, i + 2).map((t) =>
+        inlineButton({
+          text: `📦 ${t.name}`,
+          callbackData: `wiz:tpl:${t.slug}`,
+          style: BUTTON_STYLES.PRIMARY,
+        })
+      );
+      rows.push(pair);
+    }
+    for (const cs of comingSoon) {
+      rows.push([
+        inlineButton({
+          text: `🕒 ${cs.name} (Coming Soon)`,
+          callbackData: `mb:coming_soon:${cs.slug}`,
+          style: BUTTON_STYLES.DANGER,
+        }),
+      ]);
+    }
     rows.push([inlineButton({ text: '✖️ Cancel', callbackData: 'mb:home', style: BUTTON_STYLES.DANGER })]);
 
     await repos.users.setWizardState(telegramId, { flow: 'create_bot', step: 'select_template', mode: 'template' });
     await telegram.sendMessage(
       token,
       chatId,
-      '<b>Step 3/10 — Select a Prebuilt Template</b>\n\nChoose the modular template for your bot:',
+      '<b>Step 3/10 — Select a Prebuilt Template</b>\n\nAll 11 functional templates are unlocked for every user. Choose your template:',
       { reply_markup: buildInlineKeyboard(rows) }
     );
     return { ok: true };
@@ -277,6 +370,22 @@ async function handleMasterCallback({ env, repos, telegram, token, cb, user, isO
     const tpl = await repos.templates.getBySlug(slug);
     if (!tpl) {
       await telegram.sendMessage(token, chatId, '❌ Template not found.');
+      return { ok: true };
+    }
+    if (Number(tpl.is_coming_soon) === 1 || tpl.availability_status === 'coming_soon') {
+      await telegram.sendMessage(
+        token,
+        chatId,
+        `🕒 <b>${escapeHtml(tpl.name)}</b> is marked <b>COMING SOON</b> and cannot be deployed yet.`
+      );
+      return { ok: true };
+    }
+    if (Number(tpl.is_active) !== 1 || tpl.availability_status !== 'active') {
+      await telegram.sendMessage(
+        token,
+        chatId,
+        `⚠️ <b>${escapeHtml(tpl.name)}</b> is currently ${escapeHtml(tpl.availability_status || 'disabled')}.`
+      );
       return { ok: true };
     }
     await repos.users.setWizardState(telegramId, {
@@ -381,7 +490,102 @@ async function handleMasterCallback({ env, repos, telegram, token, cb, user, isO
   return { ok: true };
 }
 
-async function startCreateBotWizard({ repos, telegram, token, chatId, telegramId, forceCustom = false }) {
+async function checkPlatformForceJoin({ repos, telegram, token, telegramId }) {
+  const settings = await repos.stats.getSettings();
+  if (settings.map.platform_force_join_enabled !== 'true') {
+    return { ok: true, missing: [] };
+  }
+  let channels = [];
+  try {
+    channels = JSON.parse(settings.map.platform_force_join_channels || '[]');
+  } catch {
+    channels = [];
+  }
+  if (!Array.isArray(channels) || !channels.length) {
+    return { ok: true, missing: [] };
+  }
+
+  const missing = [];
+  for (const ch of channels) {
+    const channelId = typeof ch === 'string' ? ch : ch.id || ch.username;
+    if (!channelId) continue;
+    try {
+      const member = await telegram.getChatMember(token, channelId, telegramId);
+      const memberStatus = member?.result?.status ?? member?.status;
+      if (!memberStatus || ['left', 'kicked'].includes(memberStatus)) {
+        missing.push(channelId);
+      }
+    } catch {
+      missing.push(channelId);
+    }
+  }
+  return { ok: missing.length === 0, missing };
+}
+
+async function startCreateBotWizard({ env, repos, telegram, token, chatId, telegramId, user, forceCustom = false }) {
+  // 1. Real Platform Force Join Verification (when enabled by owner)
+  const fj = await checkPlatformForceJoin({ repos, telegram, token, telegramId });
+  if (!fj.ok) {
+    const rows = fj.missing.map((ch) => {
+      const handle = String(ch).replace(/^@/, '');
+      return [
+        inlineButton({
+          text: `📢 Join ${ch}`,
+          url: `https://t.me/${handle}`,
+          style: BUTTON_STYLES.PRIMARY,
+        }),
+      ];
+    });
+    rows.push([
+      inlineButton({
+        text: '✅ I Joined — Verify Now',
+        callbackData: 'mb:force_join_recheck',
+        style: BUTTON_STYLES.SUCCESS,
+      }),
+    ]);
+    await telegram.sendMessage(
+      token,
+      chatId,
+      '🔒 <b>Channel Membership Required</b>\n\nJoin the required BOT FACTORY channel(s) below and tap <b>✅ I Joined — Verify Now</b> to continue:',
+      { reply_markup: buildInlineKeyboard(rows) }
+    );
+    return;
+  }
+
+  // 2. Real Referral & Plan Bot Slot Check
+  const activeCount = await repos.users.countActiveBots(telegramId);
+  const refSummary = await repos.platformReferrals.getSummary(telegramId);
+  const entitlement = calculatePlanEntitlement(
+    { ...user, verified_referrals: refSummary.verified },
+    activeCount,
+    refSummary.pending
+  );
+
+  if (!entitlement.canCreateBot) {
+    const refLink = buildMasterReferralLink(env, user.referral_code);
+    await telegram.sendMessage(
+      token,
+      chatId,
+      [
+        '⚠️ <b>Bot Creation Slot Limit Reached</b>',
+        '',
+        `• <b>Current Plan:</b> ${entitlement.planLabel}`,
+        `• <b>Active Bots:</b> ${entitlement.activeBotCount} / ${entitlement.maxBotsLabel}`,
+        `• <b>Verified Referrals:</b> ${entitlement.verifiedReferrals}`,
+        '',
+        'Invite new creators with your personal referral link (+1 bot slot per verified referral, 8 = Starter, 48 = Pro, 50 = Enterprise Unlimited):',
+        refLink ? `<code>${escapeHtml(refLink)}</code>` : `Referral Code: <code>${escapeHtml(user.referral_code || '')}</code>`,
+      ].join('\n'),
+      {
+        reply_markup: buildInlineKeyboard([
+          [inlineButton({ text: '💎 View Plans & Referrals', callbackData: 'mb:plans', style: BUTTON_STYLES.PRIMARY })],
+          [inlineButton({ text: '📂 Manage Existing Bots', callbackData: 'mb:my_bots', style: BUTTON_STYLES.SUCCESS })],
+        ]),
+      }
+    );
+    return;
+  }
+
   if (forceCustom) {
     await repos.users.setWizardState(telegramId, {
       flow: 'create_bot',
@@ -398,7 +602,12 @@ async function startCreateBotWizard({ repos, telegram, token, chatId, telegramId
   await telegram.sendMessage(
     token,
     chatId,
-    '<b>Step 2/10 — Choose Creation Mode</b>\n\nLaunch instantly with a Prebuilt Template or craft a bespoke bot using the Custom No-Code Bot Builder:',
+    [
+      '<b>Step 2/10 — Choose Creation Mode</b>',
+      `Available Slots: <b>${entitlement.isUnlimited ? 'Unlimited' : `${entitlement.remainingSlots} remaining (${entitlement.activeBotCount}/${entitlement.maxBotsLabel})`}</b>`,
+      '',
+      'Launch instantly with any of the 11 Prebuilt Templates or build a bespoke bot with the Custom No-Code Bot Builder:',
+    ].join('\n'),
     {
       reply_markup: buildInlineKeyboard([
         [
@@ -451,6 +660,40 @@ async function handleWizardTextStep({ env, repos, telegram, token, chatId, teleg
       chatId,
       'Confirm launching this Global Broadcast across all active BOT FACTORY bots?',
       { reply_markup: buildConfirmCancelKeyboard(`owner:brc_launch:${draft.id}`, 'owner:home', '🚀 Launch Global Broadcast', '✖️ Cancel') }
+    );
+    return { ok: true };
+  }
+
+  // Default Creator Support Contact wizard
+  if (wizard.flow === 'add_support' && wizard.step === 'await_input') {
+    const [handleRaw, messageRaw] = text.split('|').map((s) => s?.trim());
+    const supCheck = validateSupportUsername(handleRaw || '');
+    if (!supCheck.valid) {
+      await telegram.sendMessage(
+        token,
+        chatId,
+        `❌ ${escapeHtml(supCheck.error)}\nSend: <code>@YourSupportHandle | Optional support message</code> or /cancel.`
+      );
+      return { ok: true };
+    }
+    await repos.users.updateSupportSettings(telegramId, {
+      supportUsername: supCheck.username,
+      supportMessage: (messageRaw || '').slice(0, 300),
+    });
+    await repos.users.setWizardState(telegramId, null);
+    await telegram.sendMessage(
+      token,
+      chatId,
+      [
+        '✅ <b>Default Support Contact Saved</b>',
+        `• <b>Handle:</b> ${escapeHtml(supCheck.username || 'Cleared')}`,
+        messageRaw ? `• <b>Support Note:</b> ${escapeHtml(messageRaw.slice(0, 300))}` : '',
+        '',
+        'This handle is now available as your default support identity across your BOT FACTORY workspace.',
+      ]
+        .filter(Boolean)
+        .join('\n'),
+      { reply_markup: buildMasterMainReplyKeyboard(isOwner) }
     );
     return { ok: true };
   }
@@ -515,12 +758,34 @@ async function handleWizardTextStep({ env, repos, telegram, token, chatId, teleg
     return { ok: true };
   }
 
-  // Step 6 -> Step 7a: Branding (Support username & footer)
+  // Step 6 -> Optional Festive Bonus campaign setup OR Step 7a Branding
   if (wizard.step === 'await_description') {
+    const description = text.slice(0, 400);
+    if (wizard.templateSlug === 'festive-bonus') {
+      await repos.users.setWizardState(telegramId, {
+        ...wizard,
+        step: 'await_festive_config',
+        description,
+      });
+      await telegram.sendMessage(
+        token,
+        chatId,
+        [
+          '<b>🎉 Festive Bonus Campaign Setup</b>',
+          'Configure your campaign details separated by <code>|</code> (or send <code>skip</code> for defaults):',
+          '<code>Campaign Name | Bonus Reward | Min Referrals | Max Claims (0 = unlimited)</code>',
+          '',
+          'Example:',
+          '<code>Diwali Mega Bonus | 100 | 3 | 500</code>',
+        ].join('\n')
+      );
+      return { ok: true };
+    }
+
     await repos.users.setWizardState(telegramId, {
       ...wizard,
       step: 'await_branding',
-      description: text.slice(0, 400),
+      description,
     });
     await telegram.sendMessage(
       token,
@@ -532,6 +797,46 @@ async function handleWizardTextStep({ env, repos, telegram, token, chatId, teleg
         '',
         'Example:',
         '<code>Nova Digital | Powered by Nova | @NovaSupport</code>',
+      ].join('\n')
+    );
+    return { ok: true };
+  }
+
+  // Optional Festive Bonus campaign configuration step -> Step 7a Branding
+  if (wizard.step === 'await_festive_config') {
+    let templateConfig = {
+      campaignName: 'Festive Celebration Bonus',
+      rewardAmount: 50,
+      minReferrals: 0,
+      maxClaims: 0,
+    };
+    if (text.toLowerCase() !== 'skip') {
+      const [campaignName, rewardStr, minRefStr, maxClaimsStr] = text.split('|').map((s) => s?.trim());
+      if (campaignName) templateConfig.campaignName = campaignName.slice(0, 80);
+      if (rewardStr && Number.isFinite(Number(rewardStr))) {
+        templateConfig.rewardAmount = Math.max(1, Number(rewardStr));
+      }
+      if (minRefStr && Number.isFinite(Number(minRefStr))) {
+        templateConfig.minReferrals = Math.max(0, Math.trunc(Number(minRefStr)));
+      }
+      if (maxClaimsStr && Number.isFinite(Number(maxClaimsStr))) {
+        templateConfig.maxClaims = Math.max(0, Math.trunc(Number(maxClaimsStr)));
+      }
+    }
+    await repos.users.setWizardState(telegramId, {
+      ...wizard,
+      step: 'await_branding',
+      templateConfig,
+    });
+    await telegram.sendMessage(
+      token,
+      chatId,
+      [
+        `✅ Campaign configured: <b>${escapeHtml(templateConfig.campaignName)}</b> (Reward: ${templateConfig.rewardAmount}, Min Refs: ${templateConfig.minReferrals})`,
+        '',
+        '<b>Step 7/10 — Branding Configuration</b>',
+        'Send your branding details separated by <code>|</code> (or send <code>skip</code> for defaults):',
+        '<code>Brand Title | Footer Text | @SupportHandle | Welcome Image URL (optional)</code>',
       ].join('\n')
     );
     return { ok: true };
@@ -638,15 +943,30 @@ async function executeAnimatedDeployment({ env, repos, telegram, token, chatId, 
 
   const stages = [
     {
-      id: 'init',
-      label: '⚡ Initializing Bot Factory workspace...',
-      doneLabel: 'Workspace initialized',
+      id: 'validate_credentials',
+      label: '1/6 · Validating credentials via Telegram getMe...',
+      doneLabel: '1/6 · Credentials validated',
+      run: async () => {
+        await validateTokenForDeployment({
+          telegram,
+          repos,
+          rawToken: wizard.rawToken,
+          ownerTelegramId: telegramId,
+          allowRetryFailed: true,
+        });
+        return { validated: true };
+      },
+    },
+    {
+      id: 'prepare_config',
+      label: '2/6 · Preparing bot configuration & encrypting token...',
+      doneLabel: '2/6 · Configuration prepared & encrypted',
       run: async () => ({ ready: true }),
     },
     {
-      id: 'deploy',
-      label: '🔐 Encrypting credentials, persisting D1 & verifying Telegram webhook...',
-      doneLabel: 'Credentials encrypted, D1 persisted & Telegram webhook verified',
+      id: 'deploy_pipeline',
+      label: '3–5/6 · Saving D1 records, registering & verifying webhook...',
+      doneLabel: '3–5/6 · D1 saved, webhook registered & verified via getWebhookInfo',
       run: async () => {
         deployedResult = await deployTenantBot({
           env,
@@ -660,14 +980,15 @@ async function executeAnimatedDeployment({ env, repos, telegram, token, chatId, 
           description: wizard.description,
           branding: wizard.branding,
           customMenus,
+          templateConfig: wizard.templateConfig || null,
         });
         return deployedResult;
       },
     },
     {
-      id: 'finalize',
-      label: '🧪 Finalizing live engine routing...',
-      doneLabel: 'Live multi-tenant routing active',
+      id: 'activate_bot',
+      label: '6/6 · Activating multi-tenant bot & scrubbing session...',
+      doneLabel: '6/6 · Bot activated on Cloudflare Workers',
       run: async () => {
         // Immediately scrub plaintext token from wizard state!
         await repos.users.setWizardState(telegramId, null);
@@ -767,28 +1088,61 @@ async function sendUserBotDetail({ telegram, token, chatId, bot }) {
         }),
         inlineButton({ text: '🔴 Delete Bot', callbackData: `mb:bot_del_ask:${bot.id}`, style: BUTTON_STYLES.DANGER }),
       ],
-      [inlineButton({ text: '⬅️ Back to My Bots', callbackData: 'mb:my_bots', style: BUTTON_STYLES.DEFAULT })],
+      [inlineButton({ text: '⬅️ Back to My Bots', callbackData: 'mb:my_bots', style: BUTTON_STYLES.PRIMARY })],
     ]),
   });
 }
 
-async function showThemeStudio({ telegram, token, chatId }) {
-  const themes = listThemePresets();
-  const lines = themes.map((t) => `${t.headerPrefix} <b>${t.name}</b> — ID: <code>${t.id}</code>`).join('\n');
-  await telegram.sendMessage(
-    token,
-    chatId,
-    formatBrandedMessage(
-      { brandTitle: 'BOT FACTORY Theme Studio', themeId: 'obsidian_neon' },
-      {
-        heading: '🎨 Available Visual Themes',
-        body: `${lines}\n\nThemes apply automatically during Step 7 of bot creation or via the BOT FACTORY web dashboard.`,
-      }
-    )
-  );
+async function showTemplateStudio({ repos, telegram, token, chatId }) {
+  const all = await repos.templates.listAllForStudio();
+  const studioItems = all.filter((t) => t.slug !== 'custom-builder');
+  const active = studioItems.filter((t) => Number(t.is_coming_soon) !== 1 && t.availability_status === 'active' && Number(t.is_active) === 1);
+  const comingSoon = studioItems.filter((t) => Number(t.is_coming_soon) === 1 || t.availability_status === 'coming_soon');
+
+  const lines = [
+    `<b>🎨 BOT FACTORY Template Studio</b>`,
+    `All <b>${active.length}</b> functional templates are included on every plan — zero template locks!`,
+    '',
+    '<b>✅ Production-Ready Templates:</b>',
+    ...active.map((t, i) => `${i + 1}. <b>${escapeHtml(t.name)}</b> — <i>${escapeHtml(t.category)}</i>`),
+  ];
+
+  if (comingSoon.length) {
+    lines.push('', '<b>🕒 Coming Soon:</b>');
+    for (const cs of comingSoon) {
+      lines.push(`• <b>${escapeHtml(cs.name)}</b> — <i>COMING SOON</i>`);
+    }
+  }
+
+  const rows = [];
+  for (let i = 0; i < active.length; i += 2) {
+    rows.push(
+      active.slice(i, i + 2).map((t) =>
+        inlineButton({
+          text: `🚀 ${t.name}`,
+          callbackData: `wiz:tpl:${t.slug}`,
+          style: BUTTON_STYLES.SUCCESS,
+        })
+      )
+    );
+  }
+  for (const cs of comingSoon) {
+    rows.push([
+      inlineButton({
+        text: `🕒 ${cs.name} (Coming Soon)`,
+        callbackData: `mb:coming_soon:${cs.slug}`,
+        style: BUTTON_STYLES.DANGER,
+      }),
+    ]);
+  }
+  rows.push([inlineButton({ text: '🧩 Open Custom Bot Builder', callbackData: 'mb:builder', style: BUTTON_STYLES.PRIMARY })]);
+
+  await telegram.sendMessage(token, chatId, lines.join('\n'), {
+    reply_markup: buildInlineKeyboard(rows),
+  });
 }
 
-async function showCreatorStatistics({ repos, telegram, token, chatId, telegramId }) {
+async function showCreatorStatistics({ repos, telegram, token, chatId, telegramId, user }) {
   await withLoadingMessage({
     telegram,
     token,
@@ -799,49 +1153,172 @@ async function showCreatorStatistics({ repos, telegram, token, chatId, telegramI
       const active = bots.filter((b) => b.status === 'active' && b.webhook_status === 'verified').length;
       const totalUsers = bots.reduce((s, b) => s + Number(b.total_users || 0), 0);
       const totalUpdates = bots.reduce((s, b) => s + Number(b.total_updates || 0), 0);
+      const refSummary = await repos.platformReferrals.getSummary(telegramId);
+      const entitlement = calculatePlanEntitlement(
+        { ...user, verified_referrals: refSummary.verified },
+        bots.filter((b) => ['active', 'deploying', 'disabled'].includes(b.status)).length,
+        refSummary.pending
+      );
 
       return {
         text: [
           '<b>📊 My Creator Statistics</b>',
           '',
-          `• <b>Total Created Bots:</b> ${bots.length}`,
+          `• <b>Plan Tier:</b> ${entitlement.planLabel}`,
+          `• <b>Bot Slots Used:</b> ${entitlement.activeBotCount} / ${entitlement.maxBotsLabel}`,
           `• <b>Verified Online Bots:</b> ${active}`,
           `• <b>Combined End-Users:</b> ${totalUsers}`,
           `• <b>Combined Webhook Updates:</b> ${totalUpdates}`,
+          `• <b>Verified Referrals:</b> ${entitlement.verifiedReferrals} (Pending: ${entitlement.pendingReferrals})`,
         ].join('\n'),
         replyMarkup: buildInlineKeyboard([
-          [inlineButton({ text: '📂 View My Bots', callbackData: 'mb:my_bots', style: BUTTON_STYLES.PRIMARY })],
+          [
+            inlineButton({ text: '📂 View My Bots', callbackData: 'mb:my_bots', style: BUTTON_STYLES.PRIMARY }),
+            inlineButton({ text: '💎 Plans & Referrals', callbackData: 'mb:plans', style: BUTTON_STYLES.SUCCESS }),
+          ],
         ]),
       };
     },
   });
 }
 
-async function showPlansAndFeatures({ telegram, token, chatId, user }) {
+async function showPlansAndFeatures({ env, repos, telegram, token, chatId, user }) {
+  const telegramId = String(user.telegram_id);
+  const activeBots = await repos.users.countActiveBots(telegramId);
+  const refSummary = await repos.platformReferrals.getSummary(telegramId);
+  const entitlement = calculatePlanEntitlement(
+    { ...user, verified_referrals: refSummary.verified },
+    activeBots,
+    refSummary.pending
+  );
+  const refLink = buildMasterReferralLink(env, user.referral_code);
+  const catalog = getPlanCatalog();
+
+  const lines = [
+    '<b>💎 BOT FACTORY — Plans & Referral Unlocks</b>',
+    '',
+    `• <b>Current Plan:</b> ${entitlement.planLabel}`,
+    `• <b>Bot Slots:</b> ${entitlement.activeBotCount} / ${entitlement.maxBotsLabel} (${entitlement.isUnlimited ? 'Unlimited' : `${entitlement.remainingSlots} available`})`,
+    `• <b>Verified Referrals:</b> ${entitlement.verifiedReferrals}`,
+    `• <b>Pending Referrals:</b> ${entitlement.pendingReferrals}`,
+    entitlement.nextMilestone
+      ? `• <b>Next Milestone:</b> ${entitlement.nextMilestone.planLabel} (${entitlement.nextMilestone.remaining} more verified referrals -> ${entitlement.nextMilestone.reward})`
+      : '• <b>Milestone Status:</b> Maximum ENTERPRISE Unlimited tier unlocked!',
+    '',
+    '<b>📈 Referral Milestone Tiers (+1 bot slot per verified referral):</b>',
+    ...catalog.map(
+      (p) =>
+        `• <b>${p.name}</b> (${p.referralsRequired} refs) — ${p.maxBotsLabel} · ${p.summary}`
+    ),
+    '',
+    '<b>🔗 Your Personal Referral Link:</b>',
+    refLink ? `<code>${escapeHtml(refLink)}</code>` : `Referral Code: <code>${escapeHtml(user.referral_code || '')}</code>`,
+    '<i>Every new unique user who joins BOT FACTORY through your link permanently grants +1 bot slot. All 11 templates are free on every tier!</i>',
+  ];
+
+  if (refSummary.recent?.length) {
+    lines.push('', '<b>🕒 Recent Referrals:</b>');
+    for (const r of refSummary.recent.slice(0, 5)) {
+      const refName = r.referred_username || r.username;
+      lines.push(`• ${refName ? `@${escapeHtml(refName)}` : `User ${escapeHtml(r.referred_telegram_id)}`} — <code>${escapeHtml(r.status)}</code>`);
+    }
+  }
+
+  await telegram.sendMessage(token, chatId, lines.join('\n'), {
+    reply_markup: buildInlineKeyboard([
+      [
+        inlineButton({ text: '🤖 Create New Bot', callbackData: 'mb:create', style: BUTTON_STYLES.SUCCESS }),
+        inlineButton({ text: '📊 My Statistics', callbackData: 'mb:stats', style: BUTTON_STYLES.PRIMARY }),
+      ],
+    ]),
+  });
+}
+
+async function showAccountSettings({ repos, telegram, token, chatId, user, isOwner }) {
+  const telegramId = String(user.telegram_id);
+  const activeBots = await repos.users.countActiveBots(telegramId);
+  const refSummary = await repos.platformReferrals.getSummary(telegramId);
+  const entitlement = calculatePlanEntitlement(
+    { ...user, verified_referrals: refSummary.verified },
+    activeBots,
+    refSummary.pending
+  );
+
   await telegram.sendMessage(
     token,
     chatId,
     [
-      '<b>💎 BOT FACTORY — Plans & Capabilities</b>',
-      `Your Current Plan: <b>${String(user.plan || 'free').toUpperCase()}</b>`,
+      '<b>⚙️ Account Settings</b>',
       '',
-      '• <b>FREE:</b> Up to 2 active bots, core templates, colourful buttons, automatic webhook verification.',
-      '• <b>STARTER:</b> Up to 10 active bots, SMM Panel & Digital Commerce templates, priority KV caching.',
-      '• <b>PRO:</b> Up to 50 active bots, unlimited Custom Builder submenus, advanced analytics.',
-      '• <b>ENTERPRISE:</b> Unlimited tenant bots, custom domain worker routing, dedicated support.',
-    ].join('\n')
+      `• <b>Telegram ID:</b> <code>${escapeHtml(telegramId)}</code>`,
+      `• <b>Username:</b> ${user.username ? `@${escapeHtml(user.username)}` : 'Not set'}`,
+      `• <b>Role:</b> ${isOwner ? 'Platform Administrator' : 'Creator'}`,
+      `• <b>Plan Tier:</b> ${entitlement.planLabel}`,
+      `• <b>Bot Slots:</b> ${entitlement.activeBotCount} / ${entitlement.maxBotsLabel}`,
+      `• <b>Referral Code:</b> <code>${escapeHtml(user.referral_code || '')}</code>`,
+      `• <b>Default Support Contact:</b> ${escapeHtml(user.support_username || 'Not configured')}`,
+      user.support_message ? `• <b>Support Note:</b> ${escapeHtml(user.support_message)}` : '',
+    ]
+      .filter(Boolean)
+      .join('\n'),
+    {
+      reply_markup: buildInlineKeyboard([
+        [inlineButton({ text: '📢 Update Support Contact', callbackData: 'mb:add_support', style: BUTTON_STYLES.PRIMARY })],
+        [inlineButton({ text: '💎 Plans & Referral Link', callbackData: 'mb:plans', style: BUTTON_STYLES.SUCCESS })],
+      ]),
+    }
+  );
+}
+
+async function showHelpAndSupport({ repos, telegram, token, chatId, isOwner }) {
+  const settings = await repos.stats.getSettings();
+  const supportUsername = settings.map.platform_support_username || '';
+  const supportUrl = settings.map.platform_support_url || '';
+  const supportInstructions = settings.map.platform_support_instructions || '';
+  const supportAvailability = settings.map.platform_support_availability || '';
+  const supportMsg =
+    settings.map.platform_support_message ||
+    'Need help creating or deploying your Telegram bot? Contact official BOT FACTORY support.';
+
+  const rows = [];
+  if (supportUrl && /^https?:\/\//i.test(supportUrl)) {
+    rows.push([inlineButton({ text: '💬 Contact Official Support', url: supportUrl, style: BUTTON_STYLES.SUCCESS })]);
+  } else if (supportUsername) {
+    rows.push([
+      inlineButton({
+        text: `💬 Message ${supportUsername}`,
+        url: `https://t.me/${supportUsername.replace(/^@/, '')}`,
+        style: BUTTON_STYLES.SUCCESS,
+      }),
+    ]);
+  }
+  rows.push([inlineButton({ text: '🤖 Start Bot Creation Wizard', callbackData: 'mb:create', style: BUTTON_STYLES.PRIMARY })]);
+
+  await telegram.sendMessage(
+    token,
+    chatId,
+    [
+      '<b>📣 BOT FACTORY — Help & Support</b>',
+      '',
+      escapeHtml(supportMsg),
+      supportInstructions ? `\n<b>📋 Support Instructions:</b>\n${escapeHtml(supportInstructions)}` : '',
+      '',
+      supportUsername ? `• <b>Support Handle:</b> ${escapeHtml(supportUsername)}` : '• <b>Support Handle:</b> Configure in Owner Control Center -> Support Management',
+      supportAvailability ? `• <b>Availability:</b> ${escapeHtml(supportAvailability)}` : '',
+      '• <b>Quick Commands:</b> /start (Home) · /cancel (Abort wizard)',
+      isOwner ? '• <b>Admin Command:</b> /owner (Owner Control Center)' : '',
+    ]
+      .filter(Boolean)
+      .join('\n'),
+    { reply_markup: buildInlineKeyboard(rows) }
   );
 }
 
 function isMainMenuButton(text) {
   return [
-    '🤖 Create New Bot',
-    '📂 My Created Bots',
+    ...Object.values(MASTER_MAIN_BUTTONS),
     '🎨 Theme Studio',
     '🧩 Custom Bot Builder',
-    '📊 My Statistics',
-    '💎 Plans & Features',
     '📢 Help & Support',
-    '👑 Owner Control Center',
   ].includes(text);
 }
